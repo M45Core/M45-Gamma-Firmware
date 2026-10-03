@@ -28,7 +28,7 @@
 #define SWARM_CONNECT_TIMEOUT_MS 180
 #define SWARM_FETCH_TIMEOUT_MS 1000
 #define SWARM_ACTION_TIMEOUT_MS 30000
-#define SWARM_INFO_RESPONSE_MAX (24U * 1024U)
+#define SWARM_INFO_RESPONSE_MAX (32U * 1024U)
 #define SWARM_POST_BODY_MAX 256
 #define SWARM_TASK_STACK 6144
 
@@ -41,6 +41,7 @@ _Static_assert(SWARM_SCAN_BATCH + M45_HTTP_MAX_OPEN_SOCKETS +
 typedef struct {
     char ip[16];
     char hostname[65];
+    char device_name[M45_DEVICE_NAME_MAX + 1];
     char version[40];
     char board_version[24];
     char asic_model[24];
@@ -318,6 +319,7 @@ static bool fetch_device(const char *ip, swarm_device_t *device)
     memset(device, 0, sizeof(*device));
     strlcpy(device->ip, ip, sizeof(device->ip));
     copy_json_string(root, "hostname", device->hostname, sizeof(device->hostname));
+    copy_json_string(root, "device_name", device->device_name, sizeof(device->device_name));
     copy_json_string(root, "version", device->version, sizeof(device->version));
     copy_json_string(root, "boardVersion", device->board_version,
                      sizeof(device->board_version));
@@ -682,6 +684,7 @@ esp_err_t wifi_swarm_get_handler(httpd_req_t *req)
         }
         cJSON_AddStringToObject(item, "ip", devices[i].ip);
         cJSON_AddStringToObject(item, "hostname", devices[i].hostname);
+        cJSON_AddStringToObject(item, "device_name", devices[i].device_name);
         cJSON_AddStringToObject(item, "version", devices[i].version);
         cJSON_AddStringToObject(item, "board_version", devices[i].board_version);
         cJSON_AddStringToObject(item, "asic_model", devices[i].asic_model);

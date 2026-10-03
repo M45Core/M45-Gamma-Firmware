@@ -45,6 +45,7 @@ idf_component_register(
         "bitmain_asic.c"
         "bm1370.c"
         "m45_config.c"
+        "m45_backup_pools.c"
         "m45_fault_log.c"
         "m45_log_buffer.c"
         "mining.c"

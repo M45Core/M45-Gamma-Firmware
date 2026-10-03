@@ -35,6 +35,7 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "m45_config.h"
+#include "m45_backup_pools.h"
 #include "m45_log_buffer.h"
 #include "m45_firmware_identity.h"
 #include "m45_fault_log.h"
@@ -52,7 +53,7 @@
 #define WIFI_TEST_TIMEOUT_MS 15000
 #define WIFI_TEST_ATTEMPTS 2
 #define WIFI_TEST_RESTORE_DELAY_MS 250
-#define SETTINGS_JSON_BUFFER_SIZE 4700
+#define SETTINGS_JSON_BUFFER_SIZE 8192
 #define HTTP_URI_HANDLER_SLOTS 64
 #define HTTP_HANDLER_WARN_MS 100
 #define HTTP_JSON_BODY_DEADLINE_MS 30000
@@ -1787,12 +1788,14 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     const m45_config_t *config = m45_config_get();
     char wifi_ssid[80];
     char hostname[80];
+    char device_name[512];
     char pool_host[160];
     char backup_pool_host[160];
     char pool_user[200];
     char aux_pools_json[1120];
     json_escape(wifi_ssid, sizeof(wifi_ssid), config->wifi_ssid);
     json_escape(hostname, sizeof(hostname), config->hostname);
+    json_escape(device_name, sizeof(device_name), config->device_name);
     json_escape(pool_host, sizeof(pool_host), config->pool_host);
     json_escape(backup_pool_host, sizeof(backup_pool_host), config->backup_pool_host);
     json_escape(pool_user, sizeof(pool_user), config->pool_user);
@@ -1838,6 +1841,7 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
                  "{"
                  "\"wifi_ssid\":\"%s\","
                  "\"hostname\":\"%s\","
+                 "\"device_name\":\"%s\","
                  "\"pool_host\":\"%s\","
                  "\"pool_port\":%u,"
                  "\"pool_tls\":%s,"
@@ -1884,7 +1888,7 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
                  "\"limit_iout_warn_deciamps\":%u,"
                  "\"limit_iout_fault_deciamps\":%u"
                  "}",
-                 wifi_ssid, hostname, pool_host, config->pool_port,
+                 wifi_ssid, hostname, device_name, pool_host, config->pool_port,
                  config->pool_tls ? "true" : "false", backup_pool_host,
                  config->backup_pool_port,
                  config->backup_pool_tls ? "true" : "false",
@@ -1940,15 +1944,17 @@ static esp_err_t setup_get_handler(httpd_req_t *req)
 {
     const m45_config_t *config = m45_config_get();
     char wifi_ssid[80];
+    char device_name[512];
     char pool_host[160];
     char pool_user[200];
     json_escape(wifi_ssid, sizeof(wifi_ssid), config->wifi_ssid);
+    json_escape(device_name, sizeof(device_name), config->device_name);
     json_escape(pool_host, sizeof(pool_host), config->pool_host);
     json_escape(pool_user, sizeof(pool_user), config->pool_user);
     const uint16_t suggested_pool_difficulty =
         suggested_pool_difficulty_for_config(config);
 
-    char body[896];
+    char body[2048];
     const int body_len =
         snprintf(body, sizeof(body),
                  "{"
@@ -1956,6 +1962,7 @@ static esp_err_t setup_get_handler(httpd_req_t *req)
                  "\"setup_ssid\":\"%s\","
                  "\"setup_ip\":\"%s\","
                  "\"wifi_ssid\":\"%s\","
+                 "\"device_name\":\"%s\","
                  "\"pool_host\":\"%s\","
                  "\"pool_port\":%u,"
                  "\"pool_tls\":%s,"
@@ -1966,7 +1973,7 @@ static esp_err_t setup_get_handler(httpd_req_t *req)
                  "\"pool_suggested_difficulty\":%u"
                  "}",
                  g_setup_ap_active ? "true" : "false", g_setup_ssid, g_setup_ip,
-                 wifi_ssid, pool_host, config->pool_port,
+                 wifi_ssid, device_name, pool_host, config->pool_port,
                  config->pool_tls ? "true" : "false", pool_user,
                  config->pool_pass[0] != '\0' ? "true" : "false",
                  config->pool_difficulty,
@@ -2302,6 +2309,7 @@ static esp_err_t setup_post_handler(httpd_req_t *req)
     m45_config_t config = *m45_config_get();
     const bool ok =
         json_get_string(json, "wifi_ssid", config.wifi_ssid, sizeof(config.wifi_ssid), true) &&
+        json_get_string(json, "device_name", config.device_name, sizeof(config.device_name), false) &&
         json_get_string(json, "wifi_password", config.wifi_password,
                         sizeof(config.wifi_password), false) &&
         json_get_string(json, "pool_host", config.pool_host, sizeof(config.pool_host), false) &&
@@ -2390,6 +2398,7 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
         json_get_string(json, "wifi_password", config->wifi_password,
                         sizeof(config->wifi_password), false) &&
         json_get_string(json, "hostname", config->hostname, sizeof(config->hostname), true) &&
+        json_get_string(json, "device_name", config->device_name, sizeof(config->device_name), false) &&
         json_get_string(json, "pool_host", config->pool_host, sizeof(config->pool_host), false) &&
         json_get_string(json, "backup_pool_host", config->backup_pool_host,
                         sizeof(config->backup_pool_host), false) &&
@@ -3623,6 +3632,7 @@ static esp_err_t espminer_system_info_handler(httpd_req_t *req)
                             running != NULL ? running->label : "unknown");
     cJSON_AddStringToObject(root, "macAddr", mac);
     cJSON_AddStringToObject(root, "hostname", config->hostname);
+    cJSON_AddStringToObject(root, "device_name", config->device_name[0] ? config->device_name : config->hostname);
     cJSON_AddStringToObject(root, "ssid", config->wifi_ssid);
     cJSON_AddStringToObject(root, "wifiPass",
                             config->wifi_password[0] != '\0' ? "*****" : "");
@@ -4371,6 +4381,45 @@ static esp_err_t swarm_get_handler(httpd_req_t *req)
     return wifi_swarm_get_handler(req);
 }
 
+static esp_err_t backup_pools_get_handler(httpd_req_t *req)
+{
+    return send_cjson_response(req, m45_backup_pools_json());
+}
+
+static esp_err_t backup_pools_post_handler(httpd_req_t *req)
+{
+    if (req->content_len <= 0 || req->content_len >= M45_BACKUP_JSON_MAX_BYTES) {
+        return send_json_error(req, "413 Payload Too Large", "backup list exceeds byte budget");
+    }
+    char *body = malloc((size_t)req->content_len + 1);
+    if (!body) return send_json_error(req, "500 Internal Server Error", "out of memory");
+    size_t received = 0;
+    const uint64_t started = http_now_us();
+    while (received < req->content_len) {
+        if (http_now_us() - started > HTTP_JSON_BODY_DEADLINE_MS * 1000ULL) {
+            free(body);
+            return send_json_error(req, "408 Request Timeout", "backup upload timed out");
+        }
+        int len = httpd_req_recv(req, body + received, req->content_len - received);
+        if (len <= 0) { free(body); return ESP_FAIL; }
+        received += len;
+    }
+    body[received] = '\0';
+    cJSON *json = m45_backup_pools_parse_json(body);
+    free(body);
+    esp_err_t err = m45_backup_pools_save(json);
+    cJSON_Delete(json);
+    if (err != ESP_OK) {
+        const bool invalid = err == ESP_ERR_INVALID_ARG || err == ESP_ERR_INVALID_SIZE;
+        return send_json_error(req, invalid ? "400 Bad Request" : "507 Insufficient Storage",
+                               invalid ? "invalid backup pools" : "cannot store backup pools; shorten the list or retry");
+    }
+    if (!m45_config_get()->multi_pool_enabled) stratum_minimal_reconnect();
+    httpd_resp_set_type(req, "application/json");
+    set_no_store_headers(req);
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 static esp_err_t swarm_post_handler(httpd_req_t *req)
 {
     if (request_has_bad_page_token(req)) {
@@ -4443,6 +4492,8 @@ static esp_err_t start_http_server(void)
         {.uri = "/api/wifi-test", .method = HTTP_POST, .handler = wifi_test_handler},
         {.uri = "/api/settings", .method = HTTP_GET, .handler = settings_get_handler},
         {.uri = "/api/settings", .method = HTTP_POST, .handler = settings_post_handler},
+        {.uri = "/api/backup-pools", .method = HTTP_GET, .handler = backup_pools_get_handler},
+        {.uri = "/api/backup-pools", .method = HTTP_POST, .handler = backup_pools_post_handler},
         {.uri = "/api/runtime-tune", .method = HTTP_POST, .handler = runtime_tune_handler},
         {.uri = "/api/asic-power", .method = HTTP_POST, .handler = asic_power_handler},
         {.uri = "/api/settings/factory-reset", .method = HTTP_POST,

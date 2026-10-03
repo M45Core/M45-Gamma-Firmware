@@ -38,7 +38,7 @@ Response fields:
 | Field | Type | Notes |
 | --- | --- | --- |
 | `page_token` | string | Token used by the web UI for stale-page detection. |
-| `device_name`, `version`, `build_id`, `build_time` | string | Firmware identity. |
+| `device_name`, `version`, `build_id`, `build_time` | string | Device display name (configured name or hostname) and firmware identity. |
 | `ota_supported` | boolean | Whether an OTA partition is available. |
 | `retained_axeos_present`, `retained_axeos_count`, `ota_preserve_axeos_possible` | mixed | Retained validated AxeOS images and whether an OTA update can keep at least one. |
 | `wifi_connected`, `ip`, `wifi_rssi_dbm` | boolean/string/number | Wi-Fi state. |
@@ -100,7 +100,7 @@ Response fields:
 | Field | Type |
 | --- | --- |
 | `setup_mode`, `pool_password_set`, `pool_difficulty_auto`, `pool_tls` | boolean |
-| `setup_ssid`, `setup_ip`, `wifi_ssid`, `pool_host`, `pool_user` | string |
+| `setup_ssid`, `setup_ip`, `wifi_ssid`, `device_name`, `pool_host`, `pool_user` | string |
 | `pool_port`, `pool_difficulty`, `pool_suggested_difficulty` | number |
 
 ### `POST /api/setup`
@@ -198,8 +198,8 @@ Response fields:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `wifi_ssid`, `hostname`, `pool_host`, `backup_pool_host`, `pool_user` | string | Saved string settings. In weighted multi-pool mode, `pool_user` is an optional default username for added pools. |
-| `pool_port`, `backup_pool_port` | number | 1-65535. Backup fields are retained for compatibility and are not used by native weighted multi-pool mode. |
+| `wifi_ssid`, `hostname`, `device_name`, `pool_host`, `backup_pool_host`, `pool_user` | string | Saved string settings. `device_name` is an optional friendly name (up to 64 UTF-8 bytes); empty uses `hostname`. In weighted multi-pool mode, `pool_user` is an optional default username for added pools. |
+| `pool_port`, `backup_pool_port` | number | 1-65535. Legacy backup fields are retained for compatibility; the active ordered backup list uses `/api/backup-pools`. |
 | `pool_tls`, `backup_pool_tls` | boolean | Enables verified TLS for the single Stratum pool. Backup fields are retained for compatibility. |
 | `multi_pool_enabled`, `aux_pools` | boolean/array | Enables weighted multi-pool mode. In this mode there are no implicit pools; only enabled `aux_pools` rows are scheduled. Each pool has `host`, `port`, `tls`, `enabled`, `weight`, `user`, and `password_set`. `weight` is 1-99. Empty pool `user` uses the optional default `pool_user`. |
 | `wifi_password_set`, `pool_password_set` | boolean | Password values are not returned. |
@@ -227,6 +227,37 @@ limit_tps546_temp_max_c
 limit_iout_warn_deciamps
 limit_iout_fault_deciamps
 ```
+
+### `GET /api/backup-pools`
+
+Returns the saved ordered single-mode backup list as a JSON array. An empty
+array means no backups. The new list starts empty on older installations.
+
+```json
+[
+  {"host": "first.example", "port": 3333, "tls": false},
+  {"host": "second.example", "port": 443, "tls": true}
+]
+```
+
+### `POST /api/backup-pools`
+
+Replaces the entire list using the same array format. Hosts must be nonempty
+ASCII addresses without whitespace or URL schemes, up to 96 bytes. Ports must
+be integers from 1 through 65535. `tls` is optional (default false) and must be a
+boolean when supplied. All backups share the primary pool's username/password.
+An empty array removes all backups. The list persists across reboot and pool
+mode changes and is cleared by Factory Reset.
+
+On successful persistence, returns `{"ok":true}` and reconnects the primary
+Stratum session in Single mode. Failures retain the current list. Responses are
+400 for invalid fields, 413 for requests of 32768 bytes or more, and 507 when the
+list cannot be stored. There is no fixed pool-count limit; the device's NVS
+capacity and the request byte budget apply. Backup sessions run one at a time
+and reuse the primary session; weighted mode does not use them.
+
+The dashboard has a separate **Save Backup Pools** button. Theme is a browser
+preference and is not part of the firmware settings API.
 
 ### `POST /api/settings`
 

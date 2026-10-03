@@ -20,8 +20,10 @@ the ASIC, regulator, fan, wiring, or power supply, and can create a fire risk.
   AxeOS miners on the local `/24`, and caches last-known peers in the browser.
 - Browser controls for Wi-Fi, pools, fan mode, ASIC clock/voltage, display
   sleep, screensaver, and ASIC power.
-- Single-pool or weighted multi-pool mining with per-pool weights and
-  usernames.
+- Single-pool mining with an editable ordered list of backup pools, or weighted
+  multi-pool mining with per-pool weights and usernames.
+- Friendly device names in setup, the dashboard title, and swarm cards.
+- Light and dark dashboard themes with optional browser persistence.
 - Experimental auto-clock overclocking with temperature, VIN, current,
   VR-temperature, and watt-cap guardrails.
 - Stock clock and voltage enforcement unless overclocking is explicitly
@@ -61,6 +63,34 @@ network, open the displayed setup address, then enter Wi-Fi and pool settings.
 
 After the device joins Wi-Fi, the OLED shows the local dashboard address and an
 HTTP QR code.
+
+### Device Name, Backup Pools, And Theme
+
+Enter an optional **Device Name** during first-boot setup or in Settings. It is
+shown in the dashboard title and swarm cards. Names can contain spaces and are
+stored on the miner (up to 64 UTF-8 bytes). An empty name uses the network
+hostname; renaming the device does not reconnect Wi-Fi.
+
+In Settings, choose Single pool mode and use **Add Backup** to build an ordered
+list. Each backup has a host, port, and optional verified TLS. Move rows with the
+arrow buttons, remove unwanted rows, then click **Save Backup Pools**. This
+button saves the list independently of **Save & Apply**. Backups use the primary
+pool's username and password. Connection failures cycle through primary, each
+backup in order, then primary again. While on a backup, the miner periodically
+probes the primary and returns when it responds. Weighted mode retains the
+saved backup list but does not use it.
+
+There is no fixed pool-count limit. The list is allocated dynamically and stored
+as an NVS blob; available flash storage and a 32 KiB JSON request budget bound its
+size. Failed saves keep the active list. Older firmware's legacy backup fields
+remain compatibility settings; they do not automatically populate this list.
+Factory Reset clears names and backups.
+
+Choose **Dashboard Theme** under Display. Changes apply immediately. Select
+**Remember theme in this browser** to restore the choice on later visits,
+including Wi-Fi setup. With remembering disabled, later page loads use Dark.
+The preference belongs to that browser and device URL and can also be cleared
+by clearing browser site data.
 
 ### Physical Recovery
 
@@ -184,6 +214,15 @@ scripts/build.sh --flash /dev/ttyUSB0
 ```
 
 `scripts/build.sh --help` lists all build-time configuration options.
+
+### Host Checks
+
+With `IDF_PATH` pointing to an ESP-IDF checkout, run
+`tests/run-backup-pools.sh` to check backup-list validation, persistence, failure
+retention, DNS caching, and endpoint rotation using the bundled cJSON source.
+The harness uses AddressSanitizer and UndefinedBehaviorSanitizer. Under a
+ptrace-based runner, use `ASAN_OPTIONS=detect_leaks=0` because LeakSanitizer
+cannot run there.
 
 ### Safety Behavior
 

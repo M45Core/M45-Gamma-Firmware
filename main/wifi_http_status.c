@@ -14,7 +14,7 @@
 #include "stratum_minimal.h"
 
 #define STATUS_JSON_BUFFER_SIZE (32 * 1024)
-#define M45_DEVICE_NAME "M45-Firmware"
+
 
 typedef struct {
     stratum_minimal_stats_t stats;
@@ -22,6 +22,7 @@ typedef struct {
     bitaxe_gamma602_safety_limits_t limits;
     bitaxe_gamma602_auto_clock_status_t auto_clock;
     char wifi_ssid[80];
+    char device_name[512];
     char pool_host[160];
     char hardware_fault_msg[96];
     char imported_board_version[32];
@@ -249,6 +250,8 @@ esp_err_t wifi_http_status_send(httpd_req_t *req,
         m45_config_effective_asic_voltage_mv_for_temp(config, asic_temp_c);
 
     json_escape(scratch->wifi_ssid, sizeof(scratch->wifi_ssid), config->wifi_ssid);
+    json_escape(scratch->device_name, sizeof(scratch->device_name),
+                config->device_name[0] ? config->device_name : config->hostname);
     json_escape(scratch->pool_host, sizeof(scratch->pool_host),
                 stats->pool_host[0] != '\0' ? stats->pool_host : config->pool_host);
     json_escape(scratch->hardware_fault_msg, sizeof(scratch->hardware_fault_msg),
@@ -506,7 +509,7 @@ esp_err_t wifi_http_status_send(httpd_req_t *req,
                  "\"fan_expected_percent\":%.0f"
                  "}"
                  "}",
-                 context->page_token, M45_DEVICE_NAME, APP_BUILD_VERSION, APP_BUILD_ID,
+                 context->page_token, scratch->device_name, APP_BUILD_VERSION, APP_BUILD_ID,
                  APP_BUILD_TIME_UTC,
                  ota_supported ? "true" : "false",
                  retained_axeos_count > 0 ? "true" : "false",

@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "m45_config.h"
+#include "m45_backup_pools.h"
 #include "m45_fault_log.h"
 #include "m45_log_buffer.h"
 #include "m45_oled.h"
@@ -57,6 +58,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
     ESP_ERROR_CHECK(m45_config_load());
+    ret = m45_backup_pools_load();
+    if (ret != ESP_OK) {
+        m45_backup_pools_clear_runtime();
+        ESP_LOGW(TAG, "backup list unavailable: %s; primary pool remains available",
+                 esp_err_to_name(ret));
+    }
     ESP_ERROR_CHECK(m45_fault_log_init());
     bitaxe_gamma602_init_state(&g_state);
 

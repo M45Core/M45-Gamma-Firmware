@@ -124,14 +124,14 @@ const first=statsChartSamples.length?statsChartSamples[0].at:now,minX=Math.max(n
 const rows=statsChartSamples.filter(r=>r.at>=minX),bestRows=statsChartBestShares.filter(r=>r.at>=minX),maxHash=Math.max(1,...rows.map(r=>r.value))*1.15,bestLogs=bestRows.map(r=>Math.log10(r.value));
 let bestLogMin=bestLogs.length?Math.min(...bestLogs):0,bestLogMax=bestLogs.length?Math.max(...bestLogs):1;if(bestLogMax-bestLogMin<1){const mid=(bestLogMin+bestLogMax)/2;bestLogMin=mid-.5;bestLogMax=mid+.5}else{const pad=(bestLogMax-bestLogMin)*.1;bestLogMin-=pad;bestLogMax+=pad}const bestLogSpan=bestLogMax-bestLogMin;
 const x=at=>left+Math.max(0,Math.min(1,(at-minX)/span))*gw,yHash=value=>top+gh*(1-Math.max(0,value)/maxHash),yBest=value=>top+gh*(1-Math.max(0,Math.min(1,(Math.log10(value)-bestLogMin)/bestLogSpan)));
-ctx.strokeStyle='#2d353d';ctx.lineWidth=1;ctx.fillStyle='#9aa6ad';ctx.font='10px ui-monospace,monospace';ctx.textAlign='right';
+const theme=getComputedStyle(document.documentElement);ctx.strokeStyle=theme.getPropertyValue('--line');ctx.lineWidth=1;ctx.fillStyle=theme.getPropertyValue('--muted');ctx.font='10px ui-monospace,monospace';ctx.textAlign='right';
 for(let i=0;i<=3;i++){const yy=top+gh*i/3;ctx.beginPath();ctx.moveTo(left,yy);ctx.lineTo(w-right,yy);ctx.stroke();ctx.fillText(statsChartHashLabel(maxHash*(1-i/3)),left-6,yy+3)}
-ctx.fillStyle='#f6b34a';ctx.textAlign='left';for(let i=0;i<=3;i++){const yy=top+gh*i/3,diff=Math.pow(10,bestLogMax-bestLogSpan*i/3);ctx.fillText(human(diff),w-right+6,yy+3)}
+ctx.fillStyle=document.documentElement.dataset.theme==='light'?'#975e00':'#f6b34a';ctx.textAlign='left';for(let i=0;i<=3;i++){const yy=top+gh*i/3,diff=Math.pow(10,bestLogMax-bestLogSpan*i/3);ctx.fillText(human(diff),w-right+6,yy+3)}
 ctx.textAlign='center';ctx.fillText(chartSpanLabel(span),left+gw/2,h-5);
 if(rows.length){const fill=ctx.createLinearGradient(0,top,0,base);fill.addColorStop(0,'rgba(44,241,194,.28)');fill.addColorStop(1,'rgba(44,241,194,.025)');ctx.beginPath();ctx.moveTo(x(rows[0].at),base);rows.forEach((r,i)=>{const xx=x(r.at),yy=yHash(r.value);if(i===0)ctx.lineTo(xx,yy);else ctx.lineTo(xx,yy)});ctx.lineTo(x(rows[rows.length-1].at),base);ctx.closePath();ctx.fillStyle=fill;ctx.fill();
-ctx.beginPath();rows.forEach((r,i)=>{const xx=x(r.at),yy=yHash(r.value);if(i===0)ctx.moveTo(xx,yy);else ctx.lineTo(xx,yy)});ctx.strokeStyle='#2cf1c2';ctx.lineWidth=2;ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke()}
-if(bestRows.length){ctx.beginPath();bestRows.forEach(r=>{const xx=x(r.at),yy=yBest(r.value);ctx.moveTo(xx+1.5,yy);ctx.arc(xx,yy,1.5,0,Math.PI*2)});ctx.fillStyle='#f6b34a';ctx.fill()}
-ctx.strokeStyle='rgba(255,255,255,.7)';ctx.beginPath();ctx.moveTo(left,base+.5);ctx.lineTo(w-right,base+.5);ctx.stroke()}
+ctx.beginPath();rows.forEach((r,i)=>{const xx=x(r.at),yy=yHash(r.value);if(i===0)ctx.moveTo(xx,yy);else ctx.lineTo(xx,yy)});ctx.strokeStyle=document.documentElement.dataset.theme==='light'?'#087d68':'#2cf1c2';ctx.lineWidth=2;ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke()}
+if(bestRows.length){ctx.beginPath();bestRows.forEach(r=>{const xx=x(r.at),yy=yBest(r.value);ctx.moveTo(xx+1.5,yy);ctx.arc(xx,yy,1.5,0,Math.PI*2)});ctx.fillStyle=document.documentElement.dataset.theme==='light'?'#975e00':'#f6b34a';ctx.fill()}
+ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--muted');ctx.beginPath();ctx.moveTo(left,base+.5);ctx.lineTo(w-right,base+.5);ctx.stroke()}
 function updateStatsChart(s){const now=Date.now(),hash=Math.max(0,Number(s&&s.hashrate_ghs)||0);
 statsChartSamples=appendChartSample(statsChartSamples,now,hash);const events=Array.isArray(s&&s.share_events)?s.share_events:[];
 events.forEach(e=>{if(!Array.isArray(e)||e.length<3)return;const seq=Number(e[0]),age=Number(e[1]),diff=Number(e[2]);if(!Number.isFinite(seq)||seq<=statsChartLastShareSeq||!Number.isFinite(age)||age<0||!Number.isFinite(diff)||diff<=0)return;const at=now-age;statsChartLastShareSeq=seq;if(at<statsChartStartedAt)return;statsChartBestShares.push({at,value:diff})});
@@ -149,8 +149,8 @@ if(canvas.width!==Math.floor(w*dpr)||canvas.height!==Math.floor(h*dpr)){canvas.w
 ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);const values=rows.map(r=>r.value),normalLo=Number(cfg.min),normalHi=Number(cfg.max);let lo=normalLo,hi=normalHi;
 if(values.length){const seenLo=Math.min(...values),seenHi=Math.max(...values),normalSpan=Math.max(.0001,normalHi-normalLo);if(seenLo<lo)lo=seenLo-normalSpan*.08;if(seenHi>hi)hi=seenHi+normalSpan*.08}
 if(!(hi>lo)){lo-=1;hi+=1}const pad=3,gw=w-pad*2,gh=h-pad*2,now=Date.now(),first=rows.length?rows[0].at:now,minX=Math.max(now-METRIC_SPARKLINE_WINDOW_MS,Math.min(first,now)),span=Math.max(1,now-minX);
-const x=at=>pad+Math.max(0,Math.min(1,(at-minX)/span))*gw,y=value=>pad+gh*(1-Math.max(0,Math.min(1,(value-lo)/(hi-lo))));ctx.strokeStyle='#27313a';ctx.lineWidth=1;
-ctx.beginPath();ctx.moveTo(pad,Math.round(h/2)+.5);ctx.lineTo(w-pad,Math.round(h/2)+.5);ctx.stroke();if(rows.length){const color=cfg.state==='bad'?'#ff6b6b':cfg.state==='warn'?'#f6b34a':'#2cf1c2';
+const x=at=>pad+Math.max(0,Math.min(1,(at-minX)/span))*gw,y=value=>pad+gh*(1-Math.max(0,Math.min(1,(value-lo)/(hi-lo))));ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--line');ctx.lineWidth=1;
+ctx.beginPath();ctx.moveTo(pad,Math.round(h/2)+.5);ctx.lineTo(w-pad,Math.round(h/2)+.5);ctx.stroke();if(rows.length){const color=cfg.state==='bad'?'#ff6b6b':cfg.state==='warn'?'#c48618':document.documentElement.dataset.theme==='light'?'#087d68':'#2cf1c2';
 const fill=ctx.createLinearGradient(0,pad,0,h-pad);fill.addColorStop(0,color+'42');fill.addColorStop(1,color+'05');ctx.beginPath();ctx.moveTo(x(rows[0].at),h-pad);rows.forEach((r,i)=>{if(i===0)ctx.lineTo(x(r.at),y(r.value));else ctx.lineTo(x(r.at),y(r.value))});ctx.lineTo(x(rows[rows.length-1].at),h-pad);ctx.closePath();ctx.fillStyle=fill;ctx.fill();
 ctx.beginPath();rows.forEach((r,i)=>{if(i===0)ctx.moveTo(x(r.at),y(r.value));else ctx.lineTo(x(r.at),y(r.value))});ctx.strokeStyle=color;ctx.lineWidth=1.5;ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke()}
 canvas.title=`10 minute trend | scale ${n(lo,cfg.decimals)}-${n(hi,cfg.decimals)}${cfg.unit||''}`}
@@ -166,7 +166,7 @@ return(Array.isArray(saved.devices)?saved.devices:[]).filter(d=>d&&d.ip&&Number.
 .map(d=>({...d,local:false,cached:true,online:false,last_seen_seconds:Math.max(Number(d.last_seen_seconds)||0,Math.floor((now-Number(d.cached_at_ms))/1000))}))}catch(_){return[]}}
 function saveSwarmCache(devices){try{const keep=devices.slice().sort((a,b)=>(b.local===true)-(a.local===true)||(Number(b.cached_at_ms)||0)-(Number(a.cached_at_ms)||0)).slice(0,SWARM_CACHE_MAX_DEVICES);
 localStorage.setItem(SWARM_CACHE_KEY,JSON.stringify({devices:keep}))}catch(_){}}
-function localSwarmDevice(info){if(!info||typeof info!=='object')return null;return{ip:String(info.ipv4||location.hostname||'local'),hostname:info.hostname||location.hostname||'Local miner',
+function localSwarmDevice(info){if(!info||typeof info!=='object')return null;return{ip:String(info.ipv4||location.hostname||'local'),hostname:info.device_name||info.hostname||location.hostname||'Local miner',
 version:info.version||info.axeOSVersion||'',board_version:info.boardVersion||'',asic_model:info.ASICModel||'',device_model:info.deviceModel||'Gamma',swarm_color:info.swarmColor||'blue',
 hashrate_ghs:Number(info.hashRate)||0,power_w:Number(info.power)||0,temp_c:Number(info.temp)||0,vr_temp_c:Number(info.vrTemp)||0,best_diff:Number(info.bestDiff)||0,
 pool_difficulty:Number(info.poolDifficulty)||0,shares_accepted:Number(info.sharesAccepted)||0,shares_rejected:Number(info.sharesRejected)||0,uptime_seconds:Number(info.uptimeSeconds)||0,
@@ -189,7 +189,7 @@ const note=document.createElement('div');note.className='subvalue';note.textCont
 devices.forEach(d=>{const card=document.createElement('article');card.className=`panel swarm-card ${d.online===false?'swarm-offline':''}`.trim();const head=document.createElement('div');head.className='swarm-card-head';
 const identity=document.createElement('div'),link=document.createElement('a');link.className='swarm-device-name';link.href=d.local?location.origin:`http://${d.ip}/`;link.target='_blank';link.rel='noopener';
 const dot=document.createElement('span');dot.className='swarm-dot';dot.style.backgroundColor=d.swarm_color||'var(--blue)';
-const name=document.createElement('span');name.textContent=d.hostname||d.ip;link.append(dot,name);const ip=document.createElement('div');ip.className='swarm-ip';ip.textContent=d.ip;identity.append(link,ip);
+const name=document.createElement('span');name.textContent=d.device_name||d.hostname||d.ip;link.append(dot,name);const ip=document.createElement('div');ip.className='swarm-ip';ip.textContent=d.ip;identity.append(link,ip);
 const hash=document.createElement('div');hash.className='swarm-card-rate';hash.textContent=swarmRate(d.hashrate_ghs);head.append(identity,hash);
 const metrics=document.createElement('div');metrics.className='swarm-metrics';metrics.append(
 swarmMetric('Power',Number(d.power_w)>0?`${n(d.power_w,1)} W`:'--'),swarmMetric('ASIC Temp',Number(d.temp_c)>0?`${n(d.temp_c,1)} C`:'--'),
@@ -422,6 +422,7 @@ const note=$('cfg-pool-weight-summary');if(note)note.textContent=`Configured wei
 syncAuxPoolLimit()}
 function multiPoolEnabled(){return val('cfg-pool-mode')==='multi'}
 function syncPoolMode(){const multi=multiPoolEnabled();document.querySelectorAll('.aux-pool-field').forEach(el=>el.classList.toggle('hidden',!multi));
+document.querySelectorAll('.backup-pool-field').forEach(el=>el.classList.toggle('hidden',multi));
 document.querySelectorAll('.single-pool-field').forEach(el=>el.classList.toggle('hidden',multi));
 txt('cfg-pool-user-label',multi?'Default Username':'Username (wallet.workername)');syncPoolWeights()}
 function syncTempCompensationNote(s=null){const cb=$('oc-temp-compensation'),note=$('oc-temp-compensation-note');if(!cb||!note)return;
@@ -634,7 +635,7 @@ const hashMax=Math.max(1,...calHistory.map(p=>Number.isFinite(num(p.hash))?p.has
 const live=$('cal-live-state');live.className=`pill ${s.hardware_fault?'bad':calibrationActive?'warn':'ok'}`;live.textContent=s.hardware_fault?'FAULT':calibrationActive?'RUN':'LIVE'}
 async function loadSettings(){try{const r=await fetch('/api/settings',{cache:'no-store'});
 if(!r.ok)throw new Error(r.status);const c=await r.json();setVal('cfg-wifi-ssid',c.wifi_ssid);
-setVal('cfg-hostname',c.hostname);setVal('cfg-pool-host',c.pool_host);setVal('cfg-pool-port',c.pool_port);
+setVal('cfg-device-name',c.device_name);setVal('cfg-hostname',c.hostname);setVal('cfg-pool-host',c.pool_host);setVal('cfg-pool-port',c.pool_port);
 $('cfg-pool-tls').checked=!!c.pool_tls;
 setVal('cfg-pool-mode',c.multi_pool_enabled?'multi':'single');
 setAuxPools(c.aux_pools||[]);
@@ -704,7 +705,7 @@ const autoClock=$('cfg-overclock-enabled').checked&&$('oc-auto-clock-enabled').c
 const sleepMax=Number($('cfg-display-sleep-minutes').max)||65535;
 const sleepMinutes=clamp(Number(val('cfg-display-sleep-minutes'))||15,1,sleepMax);
 const weightedMode=multiPoolEnabled();
-const body={wifi_ssid:val('cfg-wifi-ssid'),hostname:val('cfg-hostname'),
+const body={wifi_ssid:val('cfg-wifi-ssid'),hostname:val('cfg-hostname'),device_name:val('cfg-device-name'),
 pool_user:val('cfg-pool-user'),
 multi_pool_enabled:multiPoolEnabled(),
 aux_pools:auxPoolPayload(),
@@ -1077,3 +1078,42 @@ const panel=$('pool-status-panel');if(panel)panel.classList.add('hidden')}
 finally{refreshInFlight=false}}
 const view=routeView();showView(view);syncOverclockEnabled();syncDisplaySleep();syncPoolDifficulty();syncPoolMode();if(view==='settings'||view==='overclock'||view==='calibration')loadSettings();
 if(view==='logs'){refreshFaults();refreshLogs(true)}if(view==='swarm')refreshSwarm();refresh();setInterval(refresh,2000);setInterval(refreshSwarm,1000);setInterval(()=>refreshLogs(false),1000);setInterval(updateRefreshWarning,1000);
+
+function applyThemeChoice(){const theme=val('cfg-theme');document.documentElement.dataset.theme=theme;
+try{if($('cfg-theme-remember').checked)localStorage.setItem('m45-theme',theme);else localStorage.removeItem('m45-theme')}catch(_){}drawStatsChart();metricSparklineConfigs.forEach((_,id)=>drawMetricSparkline(id))}
+setVal('cfg-theme',document.documentElement.dataset.theme||'dark');
+try{$('cfg-theme-remember').checked=['light','dark'].includes(localStorage.getItem('m45-theme'))}catch(_){}
+$('cfg-theme').onchange=applyThemeChoice;$('cfg-theme-remember').onchange=applyThemeChoice;
+let backupsLoaded=false,backupSaving=false;
+function backupRows(){return [...$('cfg-backup-pools').children]}
+function backupPayload(){return backupRows().map(row=>({host:row.querySelector('[data-backup=host]').value.trim(),
+port:Number(row.querySelector('[data-backup=port]').value),tls:row.querySelector('[data-backup=tls]').checked}))}
+function syncBackups(){backupRows().forEach((row,i)=>{row.querySelector('.label').textContent=`Backup ${i+1}`;
+row.querySelector('[data-move=up]').disabled=i===0||backupSaving;row.querySelector('[data-move=down]').disabled=i===backupRows().length-1||backupSaving});
+$('cfg-save-backups').disabled=!backupsLoaded||backupSaving;$('cfg-add-backup-pool').disabled=!backupsLoaded||backupSaving}
+function backupDirty(){setStatus('backup-status','Unsaved backups — use Save Backup Pools.');syncBackups()}
+function addBackupPool(pool={}){const row=document.createElement('section');row.className='backup-pool-row';
+const head=document.createElement('div');head.className='aux-pool-toolbar';const title=document.createElement('div');title.className='label';head.append(title);
+const controls=document.createElement('div');controls.className='backup-actions';
+for(const [action,label]of [['up','↑'],['down','↓'],['remove','Remove']]){const b=document.createElement('button');b.type='button';b.className='secondary';b.textContent=label;b.dataset.move=action;
+b.setAttribute('aria-label',action==='remove'?'Remove backup pool':`Move backup pool ${action}`);
+b.onclick=()=>{if(action==='remove')row.remove();else if(action==='up'&&row.previousElementSibling)row.parentNode.insertBefore(row,row.previousElementSibling);
+else if(action==='down'&&row.nextElementSibling)row.parentNode.insertBefore(row.nextElementSibling,row);backupDirty()};controls.append(b)}head.append(controls);row.append(head);
+const fields=document.createElement('div');fields.className='settings-form';
+for(const [key,label,type,max]of [['host','Pool','text',96],['port','Port','number',65535],['tls','TLS','checkbox',0]]){
+const wrap=document.createElement('label');wrap.className=type==='checkbox'?'toggle-row':'field';const text=document.createElement('span');text.textContent=label;
+const input=document.createElement('input');input.type=type;input.dataset.backup=key;input.setAttribute('form','backup-pool-editor');
+if(type==='checkbox')input.checked=!!pool[key];else{input.value=pool[key]||(key==='port'?3333:'');if(type==='number'){input.min=1;input.max=max;input.step=1}else input.maxLength=max}
+input.oninput=backupDirty;wrap.append(text,input);fields.append(wrap)}row.append(fields);$('cfg-backup-pools').append(row);syncBackups()}
+async function loadBackupPools(){try{const r=await fetch('/api/backup-pools',{cache:'no-store'});if(!r.ok)throw new Error(r.status);
+const list=await r.json();if(!Array.isArray(list))throw new Error('invalid backup list');$('cfg-backup-pools').textContent='';list.forEach(addBackupPool);
+backupsLoaded=true;setStatus('backup-status',list.length?'Backups saved.':'No backups configured.');syncBackups()}
+catch(e){setStatus('backup-status',`Cannot load backups: ${e.message}. Reload to retry.`,'err');syncBackups()}}
+$('cfg-add-backup-pool').onclick=()=>{addBackupPool();backupDirty()};
+$('cfg-save-backups').onclick=async()=>{const pools=backupPayload();if(pools.some(p=>!p.host||p.host.length>96||!Number.isInteger(p.port)||p.port<1||p.port>65535||/[\s/\\"\u007f-\uffff]/.test(p.host))){setStatus('backup-status','Enter a valid host and port for every backup.','err');return}
+backupSaving=true;syncBackups();$('cfg-backup-pools').querySelectorAll('input,button').forEach(el=>el.disabled=true);
+try{const r=await fetch('/api/backup-pools',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pools)});
+const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);setStatus('backup-status','Backup pools saved.','ok')}
+catch(e){setStatus('backup-status',`Backups not saved: ${e.message}`,'err')}
+finally{backupSaving=false;$('cfg-backup-pools').querySelectorAll('input,button').forEach(el=>el.disabled=false);syncBackups()}};
+syncBackups();loadBackupPools();

@@ -1,4 +1,5 @@
 <!doctype html><html lang=en><head><meta charset=utf-8>
+<script>try{const t=localStorage.getItem('m45-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(_){}</script>
 <meta name=viewport content='width=device-width,initial-scale=1'>
 <title>M45-Firmware</title>
 <link rel=icon type=image/svg+xml href=/favicon.svg>
@@ -214,7 +215,8 @@
 <article class='panel wide'><div class=label>Network</div><div class=settings-form>
 <div class=field><label for=cfg-wifi-ssid>Wi-Fi SSID</label><input id=cfg-wifi-ssid maxlength=32 autocomplete=off></div>
 <div class=field><label for=cfg-wifi-pass>Wi-Fi Password</label><input id=cfg-wifi-pass type=password maxlength=64 placeholder='unchanged'></div>
-<div class=field><label for=cfg-hostname>Hostname</label><input id=cfg-hostname maxlength=32></div>
+<div class=field><label for=cfg-device-name>Device Name</label><input id=cfg-device-name maxlength=64 placeholder='e.g. Office Gamma'><div class=subvalue>Shown in the dashboard and swarm. Leave empty to use the hostname.</div></div>
+<div class=field><label for=cfg-hostname>Network Hostname</label><input id=cfg-hostname maxlength=32></div>
 <div class=actions><button id=cfg-wifi-test class=secondary type=button disabled>Test Connection</button>
 <span id=wifi-test-status class=status-text></span></div>
 </div></article>
@@ -228,11 +230,17 @@
 <div class='field single-pool-field'><label for=cfg-pool-pass>Password (Optional, normally just 'x')</label><input id=cfg-pool-pass type=password maxlength=64 placeholder='unchanged'></div>
 <label class=toggle-row for=cfg-pool-diff-auto><input id=cfg-pool-diff-auto type=checkbox checked><span class=label>Auto Difficulty</span></label>
 <div id=cfg-pool-diff-field class=field><label for=cfg-pool-diff>Difficulty</label><input id=cfg-pool-diff type=number min=1 max=65535></div>
+<section class='backup-pool-field full'><div class=aux-pool-toolbar><div class=label>Backup Pools</div><button id=cfg-add-backup-pool class=secondary type=button>Add Backup</button></div>
+<p class=subvalue>Try these in order when a pool fails. Uses the primary pool username and password; periodically checks for primary recovery.</p>
+<div id=cfg-backup-pools class=aux-pools></div>
+<div class=actions><button id=cfg-save-backups class=secondary type=button disabled>Save Backup Pools</button><span id=backup-status class=status-text>Loading...</span></div></section>
 <div class='aux-pool-toolbar aux-pool-field'><div class=label>Pools</div><button id=cfg-add-aux-pool class=secondary type=button>Add Pool</button></div>
 <div id=cfg-aux-pools class='aux-pools aux-pool-field'></div>
 <div class='formula-note aux-pool-field' id=cfg-pool-weight-summary>Configured weight total: 0</div>
 </div></article>
 <article class='panel wide'><div class=label>Display</div><div class=settings-form>
+<div class=field><label for=cfg-theme>Dashboard Theme</label><select id=cfg-theme><option value=dark>Dark</option><option value=light>Light</option></select></div>
+<label class=toggle-row for=cfg-theme-remember><input id=cfg-theme-remember type=checkbox><span class=label>Remember theme in this browser</span></label>
 <label class=toggle-row for=cfg-display-screensaver><input id=cfg-display-screensaver type=checkbox>
 <span class=label>Screen Saver</span></label>
 <div class=field><label for=cfg-display-sleep-mode>Display Sleep</label><select id=cfg-display-sleep-mode>
@@ -243,6 +251,6 @@
 <div class='actions settings-actions'><button id=settings-reset class=danger type=button>Factory Reset</button>
 <div class=settings-save-actions><button id=settings-save class=primary type=submit>Save &amp; Apply</button>
 <span id=settings-status class=status-text></span></div></div>
-</form></section></main>
+</form><form id=backup-pool-editor class=hidden></form></section></main>
 <footer class=app-footer><a href=https://github.com/M45Core target=_blank rel='noopener noreferrer'>M45Core on GitHub</a><span aria-hidden=true>&middot;</span><a href=https://stratumstats.m45core.com target=_blank rel='noopener noreferrer'>StratumStats</a></footer>
 {{MODALS}}<script src=/root.js></script></body></html>

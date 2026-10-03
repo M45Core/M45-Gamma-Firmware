@@ -1,4 +1,5 @@
 #include "m45_config.h"
+#include "m45_backup_pools.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -517,6 +518,7 @@ void m45_config_apply_auto_clock_policy(m45_config_t *config)
 
 static void sanitize_config(m45_config_t *config)
 {
+    config->device_name[M45_DEVICE_NAME_MAX] = '\0';
     if (hostname_is_unsuffixed_default(config->hostname)) {
         set_default_hostname(config->hostname, sizeof(config->hostname));
     }
@@ -785,6 +787,7 @@ esp_err_t m45_config_load(void)
     load_string(nvs, "wifi_ssid", loaded.wifi_ssid, sizeof(loaded.wifi_ssid));
     load_string(nvs, "wifi_pass", loaded.wifi_password, sizeof(loaded.wifi_password));
     load_string(nvs, "hostname", loaded.hostname, sizeof(loaded.hostname));
+    load_string(nvs, "device_name", loaded.device_name, sizeof(loaded.device_name));
     load_string(nvs, "pool_host", loaded.pool_host, sizeof(loaded.pool_host));
     load_string(nvs, "pool_bak_host", loaded.backup_pool_host,
                 sizeof(loaded.backup_pool_host));
@@ -953,6 +956,9 @@ esp_err_t m45_config_save(const m45_config_t *config)
     }
     if (err == ESP_OK) {
         err = nvs_set_str(nvs, "hostname", clean->hostname);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, "device_name", clean->device_name);
     }
     if (err == ESP_OK) {
         err = nvs_set_str(nvs, "pool_host", clean->pool_host);
@@ -1196,6 +1202,7 @@ esp_err_t m45_config_factory_reset(void)
         reset.wifi_ssid[0] = '\0';
         reset.wifi_password[0] = '\0';
         config_store_runtime(&reset);
+        m45_backup_pools_clear_runtime();
     }
     return err;
 }

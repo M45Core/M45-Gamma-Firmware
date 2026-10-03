@@ -1,10 +1,12 @@
 <!doctype html><html lang=en><head><meta charset=utf-8>
+<script>try{const t=localStorage.getItem('m45-theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(_){}</script>
 <meta name=viewport content='width=device-width,initial-scale=1'>
 <title>M45 Setup</title><link rel=icon type=image/svg+xml href=/favicon.svg>{{GLOBAL_STYLES}}</head><body class=setup-page><main><header><h1>M45 Setup</h1><p id=setup-meta class=meta>Loading...</p></header>
 <form id=setup-form novalidate><section class='panel scan-panel'><div class=scan-head><div>
 <div class=scan-title>Wi-Fi networks</div><span id=scan-status class='scan-status scanning'>Scanning for networks...</span>
 </div><button id=scan class=secondary type=button>Rescan for Wi-Fi</button></div><ul id=networks class=networks></ul>
 <div id=network-more></div></section><section class=panel><div class=fields>
+<div class='field full'><label for=device-name>Device Name (Optional)</label><input id=device-name maxlength=64 placeholder='e.g. Office Gamma'></div>
 <div class='field full'><label for=wifi-ssid>Network name</label><input id=wifi-ssid autocomplete=ssid required></div>
 <div class='field full'><label for=wifi-pass>Password</label><input id=wifi-pass type=password autocomplete=current-password></div>
 </div><div class=hint>Choose a network above, or enter one manually.</div>
@@ -77,7 +79,7 @@ catch(e){s.className='scan-status';s.textContent=`Scan failed. Try again. ${e.me
 async function load(){try{const r=await fetch('/api/setup',{cache:'no-store'});
 const s=await r.json();if(!r.ok)throw new Error(s.error||r.status);
 $('setup-meta').textContent=`Network ${s.setup_ssid||'--'} | Address ${s.setup_ip||'--'}`;
-set('wifi-ssid',s.wifi_ssid);set('pool-host',s.pool_host);set('pool-port',s.pool_port||3333);
+set('device-name',s.device_name);set('wifi-ssid',s.wifi_ssid);set('pool-host',s.pool_host);set('pool-port',s.pool_port||3333);
 $('pool-tls').checked=!!s.pool_tls;
 set('pool-user',s.pool_user);$('pool-diff').dataset.manual=s.pool_difficulty||1000;
 $('pool-diff').dataset.auto=s.pool_suggested_difficulty||s.pool_difficulty||1000;set('pool-diff',s.pool_difficulty||1000);
@@ -87,7 +89,7 @@ resetWifiTest(s.wifi_ssid?'Test connection before saving.':'');scan()}
 catch(e){status(`setup load failed: ${e.message||e}`,'err')}}
 $('setup-form').onsubmit=async e=>{e.preventDefault();if(!wifiReady()){status('test Wi-Fi connection before saving','err');setSaveEnabled();return}
 const btn=$('save');btn.disabled=true;status('saving...');
-const body={wifi_ssid:$('wifi-ssid').value.trim(),wifi_password:$('wifi-pass').value,
+const body={device_name:$('device-name').value.trim(),wifi_ssid:$('wifi-ssid').value.trim(),wifi_password:$('wifi-pass').value,
 pool_host:$('pool-host').value.trim(),pool_port:Number($('pool-port').value),
 pool_tls:$('pool-tls').checked,
 pool_user:$('pool-user').value.trim(),pool_difficulty_auto:$('pool-diff-auto').checked,

@@ -31,6 +31,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "m45_config.h"
+#include "m45_backup_pools.h"
 #include "m45_log_buffer.h"
 #include "mining.h"
 #include "utils.h"
@@ -141,7 +142,8 @@ static size_t g_rx_buffer_size[STRATUM_POOL_SESSION_MAX];
 static size_t g_rx_buffer_len[STRATUM_POOL_SESSION_MAX];
 static atomic_bool g_connected;
 static atomic_bool g_work_paused;
-static atomic_bool g_next_using_backup_pool;
+/* Zero selects primary; 1..count select ordered backups. */
+static atomic_size_t g_next_pool_endpoint;
 static atomic_bool g_switch_to_primary_requested;
 static atomic_bool g_primary_probe_in_progress;
 static atomic_ullong g_last_primary_probe_us;
@@ -516,8 +518,7 @@ static void pool_credentials(uint8_t pool_id, char *user, size_t user_len,
 
 static bool backup_pool_configured(const m45_config_t *config)
 {
-    (void)config;
-    return false;
+    return config != NULL && !config->multi_pool_enabled && m45_backup_pools_count() > 0;
 }
 
 static bool aux_pool_configured(const m45_config_t *config, uint8_t pool_id)
@@ -864,16 +865,20 @@ static bool select_next_pool_endpoint(uint8_t pool_id, stratum_endpoint_t *endpo
         return true;
     }
 
-    const bool using_backup = atomic_load(&g_next_using_backup_pool) &&
-                              backup_pool_configured(config);
-
-    copy_pool_host(endpoint->host, sizeof(endpoint->host),
-                   using_backup ? config->backup_pool_host : config->pool_host);
-    copy_pool_ip(endpoint->cached_ip, sizeof(endpoint->cached_ip),
-                 using_backup ? config->backup_pool_ip : config->pool_ip);
-    endpoint->port = using_backup ? config->backup_pool_port : config->pool_port;
-    endpoint->tls = using_backup ? config->backup_pool_tls : config->pool_tls;
-    endpoint->using_backup = using_backup;
+    const size_t selection = atomic_load(&g_next_pool_endpoint);
+    m45_backup_pool_t backup;
+    if (selection > 0 && m45_backup_pool_get(selection - 1, &backup)) {
+        copy_pool_host(endpoint->host, sizeof(endpoint->host), backup.host);
+        copy_pool_ip(endpoint->cached_ip, sizeof(endpoint->cached_ip), backup.ip);
+        endpoint->port = backup.port;
+        endpoint->tls = backup.tls;
+        endpoint->using_backup = true;
+    } else {
+        copy_pool_host(endpoint->host, sizeof(endpoint->host), config->pool_host);
+        copy_pool_ip(endpoint->cached_ip, sizeof(endpoint->cached_ip), config->pool_ip);
+        endpoint->port = config->pool_port;
+        endpoint->tls = config->pool_tls;
+    }
     return true;
 }
 
@@ -903,8 +908,10 @@ static bool stratum_resolve_endpoint_ip4(const stratum_endpoint_t *endpoint,
         if (endpoint->auxiliary) {
             (void)m45_config_set_aux_pool_ip_cache(endpoint->aux_index,
                                                    endpoint->host, ip);
+        } else if (!endpoint->using_backup) {
+            (void)m45_config_set_pool_ip_cache(false, endpoint->host, ip);
         } else {
-            (void)m45_config_set_pool_ip_cache(endpoint->using_backup, endpoint->host, ip);
+            m45_backup_pool_cache_ip(endpoint->host, ip);
         }
         return true;
     }
@@ -946,11 +953,14 @@ static bool stratum_resolve_endpoint_ip4(const stratum_endpoint_t *endpoint,
     freeaddrinfo(result);
 
     if (resolved) {
-        esp_err_t err = endpoint->auxiliary
-                            ? m45_config_set_aux_pool_ip_cache(endpoint->aux_index,
-                                                               endpoint->host, ip)
-                            : m45_config_set_pool_ip_cache(endpoint->using_backup,
-                                                           endpoint->host, ip);
+        esp_err_t err = ESP_OK;
+        if (endpoint->auxiliary) {
+            err = m45_config_set_aux_pool_ip_cache(endpoint->aux_index, endpoint->host, ip);
+        } else if (endpoint->using_backup) {
+            m45_backup_pool_cache_ip(endpoint->host, ip);
+        } else {
+            err = m45_config_set_pool_ip_cache(false, endpoint->host, ip);
+        }
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
             ESP_LOGW(TAG, "failed to save %s pool IP %s: %s",
                      endpoint->auxiliary ? "aux" : endpoint->using_backup ? "backup"
@@ -1005,8 +1015,9 @@ static bool stratum_connect_host_for_endpoint(const stratum_endpoint_t *endpoint
 static void stratum_maybe_prefetch_backup_pool_dns(const stratum_endpoint_t *current)
 {
     const m45_config_t *config = m45_config_get();
-    if (!backup_pool_configured(config) || config->backup_pool_ip[0] != '\0' ||
-        (current != NULL && current->using_backup)) {
+    m45_backup_pool_t first;
+    if (!backup_pool_configured(config) || !m45_backup_pool_get(0, &first) ||
+        first.ip[0] != '\0' || (current != NULL && current->using_backup)) {
         return;
     }
 
@@ -1019,12 +1030,11 @@ static void stratum_maybe_prefetch_backup_pool_dns(const stratum_endpoint_t *cur
     atomic_store(&g_last_dns_prefetch_us, now_us);
 
     stratum_endpoint_t backup = {
-        .port = config->backup_pool_port,
-        .tls = config->backup_pool_tls,
+        .port = first.port,
+        .tls = first.tls,
         .using_backup = true,
     };
-    copy_pool_host(backup.host, sizeof(backup.host), config->backup_pool_host);
-    copy_pool_ip(backup.cached_ip, sizeof(backup.cached_ip), config->backup_pool_ip);
+    copy_pool_host(backup.host, sizeof(backup.host), first.host);
 
     char resolved_ip[M45_POOL_IP_MAX + 1];
     (void)stratum_resolve_endpoint_ip4(&backup, resolved_ip, sizeof(resolved_ip), NULL);
@@ -1034,10 +1044,11 @@ static void rotate_next_pool_endpoint(void)
 {
     const m45_config_t *config = m45_config_get();
     if (!backup_pool_configured(config)) {
-        atomic_store(&g_next_using_backup_pool, false);
+        atomic_store(&g_next_pool_endpoint, 0);
         return;
     }
-    atomic_store(&g_next_using_backup_pool, !atomic_load(&g_next_using_backup_pool));
+    atomic_store(&g_next_pool_endpoint,
+                 m45_backup_pools_next_index(atomic_load(&g_next_pool_endpoint)));
 }
 
 static void request_stratum_transport_close(bool clear_work)
@@ -2147,7 +2158,7 @@ void stratum_minimal_reconnect(void)
         return;
     }
 
-    atomic_store(&g_next_using_backup_pool, false);
+    atomic_store(&g_next_pool_endpoint, 0);
     atomic_store(&g_switch_to_primary_requested, false);
     clear_all_pool_runtime_state();
     set_active_primary_pool_endpoint();
@@ -2175,7 +2186,7 @@ void stratum_minimal_reconnect_pools(uint32_t pool_mask)
     }
 
     if ((pool_mask & 1u) != 0) {
-        atomic_store(&g_next_using_backup_pool, false);
+        atomic_store(&g_next_pool_endpoint, 0);
         atomic_store(&g_switch_to_primary_requested, false);
         clear_pool_runtime_state(STRATUM_PRIMARY_POOL_ID);
         set_active_primary_pool_endpoint();
@@ -2285,7 +2296,7 @@ static void stratum_primary_probe_task(void *arg)
         if (wifi_http_connected() && active.using_backup &&
             strcmp(config->pool_host, probe.host) == 0 && config->pool_port == probe.port) {
             atomic_store(&g_switch_to_primary_requested, true);
-            atomic_store(&g_next_using_backup_pool, false);
+            atomic_store(&g_next_pool_endpoint, 0);
             request_pool_transport_close(STRATUM_PRIMARY_POOL_ID, true);
             ESP_LOGI(TAG, "primary pool is reachable again; switching from backup");
         }
@@ -4008,7 +4019,7 @@ static void stratum_rx_task(void *arg)
             rotate_endpoint = true;
             if (pool_id == STRATUM_PRIMARY_POOL_ID) {
                 if (atomic_exchange(&g_switch_to_primary_requested, false)) {
-                    atomic_store(&g_next_using_backup_pool, false);
+                    atomic_store(&g_next_pool_endpoint, 0);
                 } else if (rotate_endpoint) {
                     rotate_next_pool_endpoint();
                 }
@@ -4044,7 +4055,7 @@ static void stratum_rx_task(void *arg)
             rotate_endpoint = true;
             if (pool_id == STRATUM_PRIMARY_POOL_ID) {
                 if (atomic_exchange(&g_switch_to_primary_requested, false)) {
-                    atomic_store(&g_next_using_backup_pool, false);
+                    atomic_store(&g_next_pool_endpoint, 0);
                 } else if (rotate_endpoint) {
                     rotate_next_pool_endpoint();
                 }
@@ -4061,7 +4072,7 @@ static void stratum_rx_task(void *arg)
             rotate_endpoint = true;
             if (pool_id == STRATUM_PRIMARY_POOL_ID) {
                 if (atomic_exchange(&g_switch_to_primary_requested, false)) {
-                    atomic_store(&g_next_using_backup_pool, false);
+                    atomic_store(&g_next_pool_endpoint, 0);
                 } else if (rotate_endpoint) {
                     rotate_next_pool_endpoint();
                 }
@@ -4110,7 +4121,7 @@ static void stratum_rx_task(void *arg)
         ESP_LOGW(TAG, "%s pool disconnected", pool_label);
         if (pool_id == STRATUM_PRIMARY_POOL_ID) {
             if (atomic_exchange(&g_switch_to_primary_requested, false)) {
-                atomic_store(&g_next_using_backup_pool, false);
+                atomic_store(&g_next_pool_endpoint, 0);
             } else if (rotate_endpoint) {
                 rotate_next_pool_endpoint();
             }
@@ -4988,7 +4999,7 @@ static void result_task(void *arg)
 esp_err_t stratum_minimal_start(GlobalState *state)
 {
     g_state = state;
-    atomic_store(&g_next_using_backup_pool, false);
+    atomic_store(&g_next_pool_endpoint, 0);
     atomic_store(&g_switch_to_primary_requested, false);
     atomic_store(&g_primary_probe_in_progress, false);
     atomic_store(&g_last_primary_probe_us, 0);

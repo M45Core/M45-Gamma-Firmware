@@ -9,6 +9,7 @@
 #define M45_WIFI_SSID_MAX 32
 #define M45_WIFI_PASSWORD_MAX 64
 #define M45_HOSTNAME_MAX 32
+#define M45_DEVICE_NAME_MAX 64
 #define M45_POOL_HOST_MAX 96
 #define M45_POOL_IP_MAX 45
 #define M45_POOL_USER_MAX 128
@@ -76,6 +77,7 @@ typedef struct {
     char wifi_ssid[M45_WIFI_SSID_MAX + 1];
     char wifi_password[M45_WIFI_PASSWORD_MAX + 1];
     char hostname[M45_HOSTNAME_MAX + 1];
+    char device_name[M45_DEVICE_NAME_MAX + 1];
     char pool_host[M45_POOL_HOST_MAX + 1];
     char backup_pool_host[M45_POOL_HOST_MAX + 1];
     char pool_ip[M45_POOL_IP_MAX + 1];
