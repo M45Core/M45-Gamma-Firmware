@@ -204,7 +204,7 @@ Response fields:
 | `multi_pool_enabled`, `aux_pools` | boolean/array | Enables weighted multi-pool mode. In this mode there are no implicit pools; only enabled `aux_pools` rows are scheduled. Each pool has `host`, `port`, `tls`, `enabled`, `weight`, `user`, and `password_set`. `weight` is 1-99. Empty pool `user` uses the optional default `pool_user`. |
 | `wifi_password_set`, `pool_password_set` | boolean | Password values are not returned. |
 | `pool_difficulty`, `pool_difficulty_auto`, `pool_suggested_difficulty` | mixed | Pool difficulty settings. |
-| `overclock_enabled`, `auto_clock_enabled`, `auto_clock_max_watts_enabled`, `auto_domain_reboot_enabled`, `asic_voltage_temp_compensation_enabled` | boolean | ASIC tuning flags. Auto clock is experimental and requires overclocking plus either fixed fan speed or no fan mode, and a high-current stable 5 V power supply with wiring/connectors rated for the configured current limits. Auto clock is capped at 1200 MHz and also blocks preset increases when cooling temperature headroom is too low, VIN is at or below 5.01 V, estimated ASIC watts exceed the enabled watt cap, or the board is near configured TPS546 output-current and VR-temperature safety limits. Auto domain reboot is off by default; when enabled, the ASIC is power-cycled if a domain remains below 75% of expected per-domain hashrate for at least 60 seconds, and pending lost-domain recovery can tolerate missing ASIC temperature reads until the reboot runs. |
+| `overclock_enabled`, `auto_clock_enabled`, `auto_clock_max_watts_enabled`, `auto_domain_reboot_enabled`, `asic_voltage_temp_compensation_enabled` | boolean | ASIC tuning flags. Auto clock is experimental and requires overclocking plus either fixed fan speed or no fan mode, and a high-current stable 5 V power supply with wiring/connectors rated for the configured current limits. Auto clock is capped at 1200 MHz and also blocks preset increases when cooling temperature headroom is too low, fresh or averaged TPS VIN is at or below max(VIN Stop Low + 0.20 V, VIN Watch Low), estimated ASIC watts exceed the enabled watt cap, or the board is near configured TPS546 output-current and VR-temperature safety limits. Low VIN triggers immediate preset backoff, at most once per second, without raising core voltage. The voltage limit stays active until both VIN readings remain at least 0.05 V above that guard for five seconds. `auto_clock_input_voltage_limited` drives the dashboard banner; `auto_clock_hold_reason` includes measured VIN, guard, and recovery threshold (or unavailable telemetry). Auto domain reboot is off by default; when enabled, the ASIC is power-cycled if a domain remains below 75% of expected per-domain hashrate for at least 60 seconds, and pending lost-domain recovery can tolerate missing ASIC temperature reads until the reboot runs. |
 | `asic_frequency_mhz`, `asic_voltage_mv`, `overclock_voltage_offset_mv`, `auto_clock_target_temp_c`, `auto_clock_max_watts` | number | ASIC tuning values. `auto_clock_max_watts` defaults to 40 and is enforced only when `auto_clock_max_watts_enabled` is true. |
 | `fan_override_enabled`, `fan_override_percent`, `fan_auto_off_allowed`, `fan_target_override_enabled`, `fan_target_temp_c` | mixed | Fan settings. |
 | `display_screensaver_enabled`, `display_sleep_minutes`, `display_sleep_max_minutes` | mixed | OLED sleep settings. |
@@ -504,6 +504,26 @@ included.
 
 ```json
 {"faults":[{"id":4,"epoch_seconds":1786801200,"uptime_seconds":32,"message":"ASIC temperature safety shutdown"}]}
+```
+
+Fault messages contain the specific condition, sampled values, configured
+thresholds where applicable, decoded TPS flags and raw status registers.
+Read failures include the register and ESP error name/code; unread measurements
+are marked unavailable. `epoch_seconds` is zero if the clock was not synchronized
+when the event occurred. `uptime_seconds` is retained alongside wall time.
+Messages support up to 1023 characters and survive reboot.
+
+### `GET /api/errors`
+
+Returns the last 64 error-level log records from the current firmware boot,
+newest first, regardless of whether live logging was active. This history is
+RAM-only and resets on reboot. Each entry has `epoch_seconds`, `uptime_seconds`,
+and `message` (up to 2047 characters, including a truncation marker if needed).
+`dropped` counts entries omitted due to capacity or allocation failure;
+`truncated` counts oversized log records; `capacity` is the entry limit.
+
+```json
+{"errors":[{"epoch_seconds":0,"uptime_seconds":5,"message":"E (5000) tps546: read timeout"}],"dropped":0,"truncated":0,"capacity":64}
 ```
 
 ### `POST /api/faults/remove`

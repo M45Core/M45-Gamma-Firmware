@@ -22,6 +22,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_random.h"
@@ -39,6 +40,7 @@
 #include "m45_log_buffer.h"
 #include "m45_firmware_identity.h"
 #include "m45_fault_log.h"
+#include "m45_error_log.h"
 #include "nvs_flash.h"
 #include "m45_oled.h"
 #include "stratum_minimal.h"
@@ -1669,6 +1671,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                                ? WIFI_TEST_CONNECTED_BIT
                                : WIFI_CONNECTED_BIT);
         ESP_LOGI(TAG, "Wi-Fi connected: %s", g_ip);
+        const esp_err_t time_err = esp_netif_sntp_start();
+        if (time_err != ESP_OK) {
+            ESP_LOGE(TAG, "clock sync start failed: %s (0x%x)",
+                     esp_err_to_name(time_err), (unsigned)time_err);
+        }
     }
 }
 
@@ -4306,31 +4313,74 @@ static esp_err_t health_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "ok");
 }
 
-static esp_err_t faults_get_handler(httpd_req_t *req)
+static esp_err_t errors_get_handler(httpd_req_t *req)
 {
-    m45_fault_entry_t entries[M45_FAULT_LOG_CAPACITY];
-    const size_t count = m45_fault_log_snapshot(entries, M45_FAULT_LOG_CAPACITY);
-    cJSON *root = cJSON_CreateObject();
-    if (root == NULL) {
+    m45_error_entry_t *entries = calloc(M45_ERROR_LOG_CAPACITY, sizeof(*entries));
+    if (entries == NULL) {
         return send_json_error(req, "500 Internal Server Error", "out of memory");
     }
-    cJSON *array = cJSON_AddArrayToObject(root, "faults");
-    if (array == NULL) {
+    uint32_t dropped = 0, truncated = 0;
+    const size_t count = m45_error_log_snapshot(entries, M45_ERROR_LOG_CAPACITY,
+                                                &dropped, &truncated);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *array = root != NULL ? cJSON_AddArrayToObject(root, "errors") : NULL;
+    if (array == NULL || cJSON_AddNumberToObject(root, "dropped", dropped) == NULL ||
+        cJSON_AddNumberToObject(root, "truncated", truncated) == NULL ||
+        cJSON_AddNumberToObject(root, "capacity", M45_ERROR_LOG_CAPACITY) == NULL) {
+        free(entries);
         cJSON_Delete(root);
         return send_json_error(req, "500 Internal Server Error", "out of memory");
     }
     for (size_t i = 0; i < count; ++i) {
         cJSON *item = cJSON_CreateObject();
-        if (item == NULL) {
+        if (item == NULL ||
+            cJSON_AddNumberToObject(item, "epoch_seconds", (double)entries[i].epoch_seconds) == NULL ||
+            cJSON_AddNumberToObject(item, "uptime_seconds", entries[i].uptime_seconds) == NULL ||
+            cJSON_AddStringToObject(item, "message", entries[i].message) == NULL) {
+            free(entries);
+            cJSON_Delete(item);
             cJSON_Delete(root);
             return send_json_error(req, "500 Internal Server Error", "out of memory");
         }
-        cJSON_AddNumberToObject(item, "id", entries[i].id);
-        cJSON_AddNumberToObject(item, "epoch_seconds", (double)entries[i].epoch_seconds);
-        cJSON_AddNumberToObject(item, "uptime_seconds", entries[i].uptime_seconds);
-        cJSON_AddStringToObject(item, "message", entries[i].message);
         cJSON_AddItemToArray(array, item);
     }
+    free(entries);
+    return send_cjson_response(req, root);
+}
+
+static esp_err_t faults_get_handler(httpd_req_t *req)
+{
+    m45_fault_entry_t *entries = calloc(M45_FAULT_LOG_CAPACITY, sizeof(*entries));
+    if (entries == NULL) {
+        return send_json_error(req, "500 Internal Server Error", "out of memory");
+    }
+    const size_t count = m45_fault_log_snapshot(entries, M45_FAULT_LOG_CAPACITY);
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        free(entries);
+        return send_json_error(req, "500 Internal Server Error", "out of memory");
+    }
+    cJSON *array = cJSON_AddArrayToObject(root, "faults");
+    if (array == NULL) {
+        cJSON_Delete(root);
+        free(entries);
+        return send_json_error(req, "500 Internal Server Error", "out of memory");
+    }
+    for (size_t i = 0; i < count; ++i) {
+        cJSON *item = cJSON_CreateObject();
+        if (item == NULL ||
+            cJSON_AddNumberToObject(item, "id", entries[i].id) == NULL ||
+            cJSON_AddNumberToObject(item, "epoch_seconds", (double)entries[i].epoch_seconds) == NULL ||
+            cJSON_AddNumberToObject(item, "uptime_seconds", entries[i].uptime_seconds) == NULL ||
+            cJSON_AddStringToObject(item, "message", entries[i].message) == NULL) {
+            cJSON_Delete(item);
+            cJSON_Delete(root);
+            free(entries);
+            return send_json_error(req, "500 Internal Server Error", "out of memory");
+        }
+        cJSON_AddItemToArray(array, item);
+    }
+    free(entries);
     return send_cjson_response(req, root);
 }
 
@@ -4511,6 +4561,7 @@ static esp_err_t start_http_server(void)
         {.uri = "/api/recovery/axeos", .method = HTTP_POST,
          .handler = axeos_return_handler},
         {.uri = "/api/logs", .method = HTTP_GET, .handler = logs_handler},
+        {.uri = "/api/errors", .method = HTTP_GET, .handler = errors_get_handler},
         {.uri = "/api/faults", .method = HTTP_GET, .handler = faults_get_handler},
         {.uri = "/api/faults/remove", .method = HTTP_POST,
          .handler = fault_remove_handler},
@@ -4570,6 +4621,14 @@ esp_err_t wifi_http_start(GlobalState *state)
     }
     ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "netif init failed");
     ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "event loop failed");
+    // Keep SNTP running for all pool types, including when hardware startup fails.
+    esp_sntp_config_t time_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    time_config.start = false;
+    const esp_err_t time_err = esp_netif_sntp_init(&time_config);
+    if (time_err != ESP_OK) {
+        ESP_LOGE(TAG, "clock sync init failed: %s (0x%x)",
+                 esp_err_to_name(time_err), (unsigned)time_err);
+    }
     init_setup_identity();
     g_netif = esp_netif_create_default_wifi_sta();
     if (g_netif != NULL) {

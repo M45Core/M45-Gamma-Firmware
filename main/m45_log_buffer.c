@@ -1,4 +1,6 @@
 #include "m45_log_buffer.h"
+#include "m45_error_log.h"
+#include "m45_fault_log.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -10,6 +12,9 @@
 #include "freertos/FreeRTOS.h"
 
 #define M45_LOG_LINE_MAX 512
+
+_Static_assert(M45_ERROR_MESSAGE_SIZE >= M45_FAULT_MESSAGE_MAX + 128,
+               "error capture must fit fault details plus the logging prefix");
 
 static char *g_log_buffer;
 static uint64_t g_log_seq;
@@ -89,13 +94,10 @@ static void append_log_bytes(const char *data, size_t len)
 
 static int m45_log_vprintf(const char *fmt, va_list args)
 {
-    if (!log_capture_active()) {
-        return g_previous_vprintf != NULL ? g_previous_vprintf(fmt, args)
-                                          : vprintf(fmt, args);
-    }
 
-    va_list copy;
+    va_list copy, detailed;
     va_copy(copy, args);
+    va_copy(detailed, args);
     const int written = g_previous_vprintf != NULL ? g_previous_vprintf(fmt, args)
                                                    : vprintf(fmt, args);
 
@@ -103,8 +105,34 @@ static int m45_log_vprintf(const char *fmt, va_list args)
     const int len = vsnprintf(line, sizeof(line), fmt, copy);
     va_end(copy);
     if (len > 0) {
-        append_log_bytes(line, len < (int)sizeof(line) ? (size_t)len : sizeof(line) - 1);
+        // ESP-IDF v1 log records start with an optional ANSI color, then E.
+        const char *prefix = line;
+        if (prefix[0] == '\033' && prefix[1] == '[') {
+            prefix += 2;
+            while (*prefix && !((unsigned char)*prefix >= 0x40 &&
+                                  (unsigned char)*prefix <= 0x7e)) ++prefix;
+            if (*prefix) ++prefix;
+        }
+        const bool is_error = prefix[0] == 'E' && prefix[1] == ' ' && prefix[2] == '(';
+        char *full_error = NULL;
+        // Do not add a 2 KiB stack buffer to every task that logs. Small
+        // background/reboot tasks have only 2-3 KiB stacks.
+        if (is_error && len >= (int)sizeof(line)) {
+            full_error = malloc(M45_ERROR_MESSAGE_SIZE);
+            if (full_error != NULL) {
+                vsnprintf(full_error, M45_ERROR_MESSAGE_SIZE, fmt, detailed);
+            }
+        }
+        const char *text = full_error != NULL ? full_error : line;
+        if (is_error) {
+            m45_error_log_append(text, len);
+        }
+        if (log_capture_active()) {
+            append_log_bytes(text, strlen(text));
+        }
+        free(full_error);
     }
+    va_end(detailed);
 
     return written;
 }

@@ -327,7 +327,7 @@ const tf=num(s&&s.auto_clock_target_frequency_mhz),tv=num(s&&s.auto_clock_target
 const capStatusOn=s&&s.auto_clock_max_watts_enabled===true,capStatusWatts=num(s&&s.auto_clock_max_watts);
 const liveCap=capStatusOn&&Number.isFinite(capStatusWatts)?` | cap ${n(capStatusWatts,0)} W`:s&&s.auto_clock_max_watts_enabled===false?' | cap off':capOn?` | cap ${capWatts} W`:' | cap off';
 const live=$('oc-auto-clock-live'),liveText=active&&Number.isFinite(tf)&&Number.isFinite(tv)?`Target ${n(tf,0)} MHz / ${n(tv,0)} mV | cooling watts ${n(pn,1)} / ${n(pt,1)} W${liveCap} | R ${n(tr,1)} C/W`:'Preset step limit: +1 / -3 levels per tick';
-let holdText='';if(ampLimited)holdText='Holding: IOUT limit';else if(vinLimited)holdText='Holding: VIN low';else if(vrLimited)holdText='Holding: VR temperature';else if(powerLimited)holdText=/max watts/i.test(reason)?'Holding: watt cap':'Holding: cooling/temperature';else if(tempLimited)holdText='Holding: temperature';
+let holdText='';if(vinLimited)holdText='Overclock limited by voltage';else if(ampLimited)holdText='Holding: IOUT limit';else if(vrLimited)holdText='Holding: VR temperature';else if(powerLimited)holdText=/max watts/i.test(reason)?'Holding: watt cap':'Holding: cooling/temperature';else if(tempLimited)holdText='Holding: temperature';
 else if(waiting)holdText=reason.replace(/^waiting/,'Waiting');
 live.title=reason;
 live.classList.toggle('oc-auto-clock-limit',limited||!!holdText);live.textContent=holdText?`${holdText} | ${liveText}`:liveText;
@@ -478,6 +478,9 @@ function showRiskModal(statusId){const r=overclockRisk();pendingRiskStatus=statu
 $('risk-list').innerHTML=`<div class='risk-row ${r.freqBad?'bad':''}'><span>Clock</span><strong>${n(r.freq,0)} MHz</strong></div>`+
 `<div class='risk-row ${r.voltBad?'bad':''}'><span>Voltage</span><strong>${n(r.volt,0)} mV</strong></div>`;
 $('risk-modal').classList.remove('hidden')}
+function setVoltageLimit(s){const active=s.auto_clock_enabled===true&&s.auto_clock_input_voltage_limited===true&&!s.hardware_fault&&s.asic_power_enabled!==false;
+$('voltage-limit-panel').classList.toggle('hidden',!active);
+txt('voltage-limit-detail',active?s.auto_clock_hold_reason||'Waiting for TPS input voltage to recover.':'')}
 function setFault(s){const p=$('fault-panel'),list=$('fault-reasons'),reasons=[];
 if(s.unsupported_board){p.classList.add('hidden');return}
 if(s.hardware_fault)reasons.push(s.hardware_fault_msg||'hardware fault');
@@ -994,8 +997,9 @@ $('settings-reset-modal').classList.add('hidden');btn.textContent='Rebooting...'
 setStatus('settings-status','Factory reset complete, rebooting...','ok');setTimeout(()=>location.reload(),5000)}
 catch(e){btn.textContent='Reset Settings';btn.disabled=false;setStatus('settings-status',`reset failed: ${e.message||e}`,'err')}};
 $('logs-verbose').onchange=()=>{logSeq=0;refreshLogs(true)};
-function faultTime(f){const epoch=Number(f.epoch_seconds);if(Number.isFinite(epoch)&&epoch>0)return new Date(epoch*1000).toLocaleString();
-return `Boot uptime ${shortTime(f.uptime_seconds)||'0s'}`}
+function faultTime(f){const uptime=`Boot uptime ${shortTime(f.uptime_seconds)||'0s'}`,epoch=Number(f.epoch_seconds);
+if(Number.isFinite(epoch)&&epoch>0)return `${new Date(epoch*1000).toLocaleString(undefined,{year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',second:'2-digit',timeZoneName:'short'})} · ${uptime}`;
+return `Clock not synchronized at event · ${uptime}`}
 function renderFaults(items){const list=$('faults-list');list.innerHTML='';if(!items.length){const empty=document.createElement('div');empty.className='subvalue';empty.textContent='No recorded faults.';list.appendChild(empty);return}
 items.forEach(f=>{const row=document.createElement('div');row.className='fault-history-row';const text=document.createElement('div');
 const message=document.createElement('div');message.className='fault-history-message';message.textContent=f.message||'Unknown fault';
@@ -1003,7 +1007,18 @@ const when=document.createElement('div');when.className='subvalue';when.textCont
 const remove=document.createElement('button');remove.type='button';remove.className='fault-history-remove';remove.title='Remove fault';remove.setAttribute('aria-label','Remove fault');remove.textContent='×';
 remove.onclick=async()=>{remove.disabled=true;try{const r=await fetch('/api/faults/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:f.id})});if(!r.ok)throw new Error(r.status);await refreshFaults()}catch(e){remove.disabled=false;setLogStatus('FAULT REMOVE FAILED','warn')}};
 row.append(text,remove);list.appendChild(row)})}
-async function refreshFaults(){try{const r=await fetch('/api/faults',{cache:'no-store'});if(!r.ok)throw new Error(r.status);const j=await r.json();renderFaults(Array.isArray(j.faults)?j.faults:[])}catch(e){const list=$('faults-list');list.textContent='Unable to load fault history.'}}
+let faultsInFlight=false;
+async function refreshFaults(){if(faultsInFlight)return;faultsInFlight=true;try{const r=await fetch('/api/faults',{cache:'no-store'});if(!r.ok)throw new Error(r.status);const j=await r.json();renderFaults(Array.isArray(j.faults)?j.faults:[])}catch(e){const list=$('faults-list');list.textContent='Unable to load fault history.'}finally{faultsInFlight=false}}
+let errorsInFlight=false;
+async function refreshErrors(){if(routeView()!=='logs'||errorsInFlight)return;errorsInFlight=true;
+try{const r=await fetch('/api/errors',{cache:'no-store'});if(!r.ok)throw new Error(r.status);const j=await r.json(),items=Array.isArray(j.errors)?j.errors:[],list=$('errors-list');list.innerHTML='';
+const notes=[`${items.length} error entries since power-on. Newest first. Resets on reboot.`];
+if(j.dropped)notes.push(`${j.dropped} older or uncaptured entries omitted; history holds ${j.capacity}.`);
+if(j.truncated)notes.push(`${j.truncated} oversized messages truncated.`);
+$('errors-summary').textContent=notes.join(' ');
+if(!items.length){list.textContent='No captured errors since power-on.';return}
+items.forEach(f=>{const row=document.createElement('div');row.className='fault-history-row';const text=document.createElement('div'),message=document.createElement('div'),when=document.createElement('div');message.className='fault-history-message';message.textContent=f.message||'Unknown error';when.className='subvalue';when.textContent=faultTime(f);text.append(message,when);row.append(text);list.appendChild(row)})
+}catch(e){$('errors-summary').textContent='Unable to refresh error history.'}finally{errorsInFlight=false}}
 $('faults-clear').onclick=async()=>{if(!confirm('Clear all recorded faults?'))return;const btn=$('faults-clear');btn.disabled=true;try{const r=await fetch('/api/faults/clear',{method:'POST'});if(!r.ok)throw new Error(r.status);await refreshFaults()}catch(e){setLogStatus('FAULT CLEAR FAILED','warn')}finally{btn.disabled=false}};
 function logText(){return $('logs-output').textContent||''}
 function setLogStatus(msg,cls='ok'){$('logs-state').className=`pill ${cls}`;$('logs-state').textContent=msg}
@@ -1035,7 +1050,7 @@ $('logs-state').className='pill ok';$('logs-state').textContent='LIVE'}
 catch(e){$('logs-state').className='pill warn';$('logs-state').textContent='OFFLINE'}finally{logsInFlight=false}}
 async function refresh(){if(refreshInFlight)return;refreshInFlight=true;try{const r=await fetch('/api/status',{cache:'no-store',headers:{'X-Page-Token':PAGE_TOKEN}});
 const s=await r.json().catch(()=>({error:r.status}));if(r.status===409){reloadFresh(s.page_token);return}
-if(!r.ok)throw new Error(s.error||r.status);if(!checkPageToken(s.page_token))return;markRefreshOk();setUnsupportedBoard(s);setFault(s);setBoot(s);syncOtaControls();
+if(!r.ok)throw new Error(s.error||r.status);if(!checkPageToken(s.page_token))return;markRefreshOk();setUnsupportedBoard(s);setFault(s);setVoltageLimit(s);setBoot(s);syncOtaControls();
 updateStatsChart(s);
 const multiPool=!!s.multi_pool_enabled;
 const device=s.device_name||'M45-Firmware';const title=`${device}: ${s.model||s.asic_model||'--'}`;txt('toolbar-title',title);document.title=title;
@@ -1077,7 +1092,7 @@ $('stratum-dot').className='status-dot bad';txt('stratum-state',String(e.message
 const panel=$('pool-status-panel');if(panel)panel.classList.add('hidden')}
 finally{refreshInFlight=false}}
 const view=routeView();showView(view);syncOverclockEnabled();syncDisplaySleep();syncPoolDifficulty();syncPoolMode();if(view==='settings'||view==='overclock'||view==='calibration')loadSettings();
-if(view==='logs'){refreshFaults();refreshLogs(true)}if(view==='swarm')refreshSwarm();refresh();setInterval(refresh,2000);setInterval(refreshSwarm,1000);setInterval(()=>refreshLogs(false),1000);setInterval(updateRefreshWarning,1000);
+if(view==='logs'){refreshFaults();refreshErrors();refreshLogs(true)}if(view==='swarm')refreshSwarm();refresh();setInterval(refresh,2000);setInterval(refreshSwarm,1000);setInterval(()=>refreshLogs(false),1000);setInterval(updateRefreshWarning,1000);setInterval(()=>{if(routeView()==='logs'){refreshFaults();refreshErrors()}},5000);
 
 function applyThemeChoice(){const theme=val('cfg-theme');document.documentElement.dataset.theme=theme;
 try{if($('cfg-theme-remember').checked)localStorage.setItem('m45-theme',theme);else localStorage.removeItem('m45-theme')}catch(_){}drawStatsChart();metricSparklineConfigs.forEach((_,id)=>drawMetricSparkline(id))}

@@ -2,6 +2,7 @@
 #define M45_TPS546_H_
 
 #include <stdint.h>
+#include <stddef.h>
 
 #include "esp_err.h"
 
@@ -14,6 +15,11 @@
 #define TPS546_INIT_OT_WARN_LIMIT 105
 
 typedef struct {
+    // Bits are set only after a successful read; partial snapshots must not
+    // report unread registers or measurements as zero.
+    uint16_t valid;
+    uint8_t failed_command;
+    esp_err_t read_error;
     uint16_t status_word;
     uint8_t st_vout;
     uint8_t st_input;
@@ -30,6 +36,16 @@ typedef struct {
     int read_temp1;
     float vout_command;
 } TPS546_StatusSnapshot;
+
+enum {
+    TPS546_FIELD_STATUS, TPS546_FIELD_VOUT_STATUS, TPS546_FIELD_INPUT_STATUS,
+    TPS546_FIELD_IOUT_STATUS, TPS546_FIELD_TEMP_STATUS, TPS546_FIELD_CML_STATUS,
+    TPS546_FIELD_MFR_STATUS, TPS546_FIELD_OTHER_STATUS, TPS546_FIELD_OPERATION,
+    TPS546_FIELD_CONFIG, TPS546_FIELD_COMMAND, TPS546_FIELD_VOUT,
+    TPS546_FIELD_VIN, TPS546_FIELD_IOUT, TPS546_FIELD_TEMP,
+    TPS546_FIELD_COUNT
+};
+#define TPS546_SNAPSHOT_ALL_VALID ((1U << TPS546_FIELD_COUNT) - 1U)
 
 typedef struct {
     uint8_t TPS546_INIT_PHASE;
@@ -101,5 +117,6 @@ esp_err_t TPS546_clear_faults(void);
 esp_err_t TPS546_snapshot_status(TPS546_StatusSnapshot *snapshot);
 const char *TPS546_model(void);
 void TPS546_log_snapshot(const TPS546_StatusSnapshot *snapshot);
+void TPS546_format_snapshot(const TPS546_StatusSnapshot *snapshot, char *dst, size_t size);
 
 #endif

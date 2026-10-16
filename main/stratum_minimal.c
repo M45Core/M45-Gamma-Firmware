@@ -52,7 +52,6 @@
 #define STRATUM_PRIMARY_PROBE_INTERVAL_MS 60000
 #define STRATUM_DNS_PREFETCH_INTERVAL_MS 60000
 #define STRATUM_NTP_SYNC_TIMEOUT_MS 15000
-#define STRATUM_NTP_REFRESH_US (3ULL * 24ULL * 60ULL * 60ULL * 1000000ULL)
 #define STRATUM_IDLE_TIMEOUT_MS 120000
 #define TRANSPORT_TIMEOUT_MS 5000
 #define STRATUM_SHARE_WRITE_TIMEOUT_MS 1000
@@ -148,8 +147,6 @@ static atomic_bool g_switch_to_primary_requested;
 static atomic_bool g_primary_probe_in_progress;
 static atomic_ullong g_last_primary_probe_us;
 static atomic_ullong g_last_dns_prefetch_us;
-static atomic_ullong g_last_ntp_attempt_us;
-static atomic_ullong g_last_ntp_sync_us;
 static atomic_uint g_work_epoch;
 static atomic_uint g_pool_work_epoch[STRATUM_POOL_SESSION_MAX];
 static atomic_uint g_work_received;
@@ -319,54 +316,18 @@ static bool ensure_asic_job_difficulty(uint8_t pool_id, double difficulty);
 static stratum_pool_session_t g_pool_sessions[STRATUM_POOL_SESSION_MAX];
 static uint8_t g_rx_task_pool_ids[STRATUM_POOL_SESSION_MAX];
 
-static bool stratum_wall_time_needs_sync(void)
-{
-    const uint64_t now_us = (uint64_t)esp_timer_get_time();
-    const uint64_t last_attempt_us = atomic_load(&g_last_ntp_attempt_us);
-    if (last_attempt_us != 0 && now_us >= last_attempt_us &&
-        now_us - last_attempt_us < STRATUM_NTP_REFRESH_US) {
-        return false;
-    }
-
-    const uint64_t last_sync_us = atomic_load(&g_last_ntp_sync_us);
-    if (last_sync_us == 0 || now_us < last_sync_us ||
-        now_us - last_sync_us >= STRATUM_NTP_REFRESH_US) {
-        return true;
-    }
-
-    time_t wall_time = 0;
-    time(&wall_time);
-    return wall_time < 1704067200;
-}
-
 static void stratum_sync_time_for_tls_if_needed(void)
 {
-    if (!stratum_wall_time_needs_sync()) {
+    if (time(NULL) >= (time_t)1704067200) {
         return;
     }
-
-    ESP_LOGI(TAG, "syncing time before TLS stratum connect");
-    atomic_store(&g_last_ntp_attempt_us, (uint64_t)esp_timer_get_time());
-    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    esp_err_t err = esp_netif_sntp_init(&config);
-    if (err == ESP_ERR_INVALID_STATE) {
-        esp_netif_sntp_deinit();
-        err = esp_netif_sntp_init(&config);
-    }
+    // Wi-Fi owns the ongoing SNTP service; TLS only waits for a usable clock.
+    // Do not deinitialize it: ordinary pools and fault timestamps need it too.
+    ESP_LOGI(TAG, "waiting for clock sync before TLS stratum connect");
+    const esp_err_t err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(STRATUM_NTP_SYNC_TIMEOUT_MS));
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "SNTP init failed: %s", esp_err_to_name(err));
-        return;
+        ESP_LOGW(TAG, "SNTP sync wait failed: %s", esp_err_to_name(err));
     }
-
-    err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(STRATUM_NTP_SYNC_TIMEOUT_MS));
-    esp_netif_sntp_deinit();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "SNTP sync failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    atomic_store(&g_last_ntp_sync_us, (uint64_t)esp_timer_get_time());
-    ESP_LOGI(TAG, "SNTP time sync complete");
 }
 
 static esp_transport_handle_t stratum_transport_init_for_endpoint(

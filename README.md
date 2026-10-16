@@ -25,7 +25,12 @@ the ASIC, regulator, fan, wiring, or power supply, and can create a fire risk.
 - Friendly device names in setup, the dashboard title, and swarm cards.
 - Light and dark dashboard themes with optional browser persistence.
 - Experimental auto-clock overclocking with temperature, VIN, current,
-  VR-temperature, and watt-cap guardrails.
+  VR-temperature, and watt-cap guardrails. Auto-clock stops increasing and backs
+  off when either fresh or averaged TPS VIN reaches VIN Stop Low + 0.20 V
+  (or VIN Watch Low, if higher). With default limits this is 5.00 V. Increases
+  remain blocked until both readings recover to at least 5.05 V for five seconds;
+  the dashboard shows “Overclock limited by voltage” with the reading and thresholds.
+  Low-VIN backoff runs at most once per second and never raises core voltage.
 - Stock clock and voltage enforcement unless overclocking is explicitly
   enabled.
 - Runtime safety-limit controls, including TPS546 PMBus limit updates.
@@ -159,8 +164,20 @@ in ordinary NVS; this firmware does not provision eFuses or enable encrypted
 NVS.
 
 The Logs page keeps the eight most recent persistent hardware/safety faults.
-Each entry has the best available date/time (or boot uptime before time sync),
-an individual remove button, and a Clear All action.
+Each entry includes the shutdown reason, measured value and configured limit,
+and TPS status flags/registers and sampled voltage, current, and temperature
+when available. Failed reads identify the PMBus register and ESP error code;
+unread values are explicitly unavailable. Date/time is displayed in the
+browser's time zone with boot uptime, or a clock-not-synchronized notice for
+events before time sync. Each entry has an individual remove button and a
+Clear All action. Existing fault history is retained when upgrading.
+
+The Logs page also shows the last 64 error-level log entries captured since the
+firmware started, even when the page was closed. This RAM-only history resets
+on reboot, retains messages up to 2 KiB, and reports omitted entries and
+truncated messages. Informational/warning logs remain in the live log view.
+Wi-Fi starts ongoing SNTP clock synchronization for both plain and TLS pools;
+clock sync does not delay mining on plain connections.
 
 ### Network Trust And Exposure
 
@@ -223,6 +240,10 @@ retention, DNS caching, and endpoint rotation using the bundled cJSON source.
 The harness uses AddressSanitizer and UndefinedBehaviorSanitizer. Under a
 ptrace-based runner, use `ASAN_OPTIONS=detect_leaks=0` because LeakSanitizer
 cannot run there.
+
+Run `tests/run-fault-diagnostics.sh` for sanitized host checks of TPS diagnostic
+formatting, legacy history migration, timestamp persistence, and error capture
+with live logging inactive.
 
 ### Safety Behavior
 

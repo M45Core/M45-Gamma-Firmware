@@ -5,18 +5,21 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
 #include "bm1370.h"
 #include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "asic_frequency_transition.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "i2c_bitaxe.h"
 #include "m45_config.h"
+#include "m45_auto_clock_voltage.h"
 #include "m45_fault_log.h"
 #include "mining.h"
 #include "asic_serial.h"
@@ -54,7 +57,6 @@
 #define AUTO_CLOCK_UP_POWER_HEADROOM_RATIO 0.97f
 #define AUTO_CLOCK_UP_CURRENT_HEADROOM_RATIO 0.90f
 #define AUTO_CLOCK_UP_VR_TEMP_HEADROOM_C 5.0f
-#define AUTO_CLOCK_UP_VIN_MIN_V 5.01f
 #define AUTO_CLOCK_HOT_MARGIN_C 2.0f
 #define AUTO_CLOCK_FAILSAFE_MARGIN_C 1.0f
 #define AUTO_CLOCK_UP_DWELL_TICKS 3
@@ -94,6 +96,7 @@ static bitaxe_gamma602_auto_clock_status_t g_auto_clock_status = {
     .thermal_resistance_c_per_w = AUTO_CLOCK_THERMAL_R_C_PER_W,
 };
 static TickType_t g_auto_clock_next_tick;
+static m45_auto_clock_voltage_state_t g_auto_clock_voltage;
 static uint8_t g_auto_clock_up_dwell_ticks;
 static uint8_t g_auto_clock_down_dwell_ticks;
 static TickType_t g_domain_reboot_next_tick;
@@ -296,6 +299,7 @@ static void give_asic_transition_lock(void)
 
 static void reset_auto_clock_control_state(void)
 {
+    memset(&g_auto_clock_voltage, 0, sizeof(g_auto_clock_voltage));
     g_auto_clock_mining_ready_since = 0;
     g_auto_clock_next_tick = 0;
     g_auto_clock_up_dwell_ticks = 0;
@@ -769,21 +773,49 @@ static void safety_shutdown(GlobalState *state, const char *reason)
     }
 }
 
+static void safety_shutdownf(GlobalState *state, const char *fmt, ...)
+{
+    char message[M45_FAULT_MESSAGE_MAX + 1];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    safety_shutdown(state, message);
+}
+
 static esp_err_t shutdown_and_return(GlobalState *state, const char *reason, esp_err_t result)
 {
-    esp_err_t shutdown_err = shutdown_regulator(state, reason);
-    if (shutdown_err != ESP_OK) {
-        ESP_LOGE(TAG, "regulator shutdown failed after %s: %s", reason,
-                 esp_err_to_name(shutdown_err));
+    char message[256];
+    snprintf(message, sizeof(message), "%s: %s (0x%x)", reason,
+             esp_err_to_name(result), (unsigned)result);
+    // Keep the failing stage instead of replacing it with "hardware init failed".
+    if (!state->SYSTEM_MODULE.hardware_fault) {
+        strlcpy(state->SYSTEM_MODULE.hardware_fault_msg, message,
+                sizeof(state->SYSTEM_MODULE.hardware_fault_msg));
     }
+    esp_err_t shutdown_err = shutdown_regulator(state, message);
+    if (shutdown_err != ESP_OK) {
+        ESP_LOGE(TAG, "regulator shutdown failed after %s: %s (0x%x)", message,
+                 esp_err_to_name(shutdown_err), (unsigned)shutdown_err);
+    }
+    (void)m45_fault_log_record(message);
     return result;
 }
 
-static esp_err_t fail_regulator_safety(GlobalState *state, const char *reason,
-                                       const TPS546_StatusSnapshot *snapshot)
+static esp_err_t fail_regulator_safety(GlobalState *state,
+                                       const TPS546_StatusSnapshot *snapshot,
+                                       const char *fmt, ...)
 {
-    TPS546_log_snapshot(snapshot);
-    safety_shutdown(state, reason);
+    char message[M45_FAULT_MESSAGE_MAX + 1];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, 256, fmt, args);
+    va_end(args);
+    size_t used = strlen(message);
+    snprintf(message + used, sizeof(message) - used, "; ");
+    used = strlen(message);
+    TPS546_format_snapshot(snapshot, message + used, sizeof(message) - used);
+    safety_shutdown(state, message);
     return ESP_FAIL;
 }
 
@@ -796,45 +828,60 @@ static esp_err_t validate_regulator_safety(GlobalState *state,
     bitaxe_gamma602_safety_limits(&limits);
 
     if (snapshot->status_word & TPS546_STATUS_FAULT_MASK) {
-        return fail_regulator_safety(state, "TPS546 status fault", snapshot);
+        return fail_regulator_safety(
+            state, snapshot,
+            "TPS546 status fault (limits: VIN %.3f-%.3fV, IOUT warn/fault %.1f/%.1fA, VR %.0fC)",
+            limits.input_voltage_min_v, limits.input_voltage_max_v, limits.iout_warn_a, limits.iout_fault_a,
+            limits.tps546_temp_max_c);
     }
 
     if ((snapshot->status_word & TPS546_STATUS_INPUT) &&
         (snapshot->st_input & TPS546_STATUS_VIN_OVF)) {
-        return fail_regulator_safety(state, "TPS546 VIN overvoltage fault", snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VIN overvoltage flag; configured limit %.3fV",
+            limits.input_voltage_max_v);
     }
 
     if ((snapshot->operation & OPERATION_ON) == 0) {
-        return fail_regulator_safety(state, "TPS546 operation bit is not ON", snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 operation is not ON: OP=0x%02x, expected ON bit=0x%02x",
+            snapshot->operation, OPERATION_ON);
     }
 
     if (snapshot->read_vin < limits.input_voltage_min_v) {
-        return fail_regulator_safety(state, "TPS546 VIN below configured limit", snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VIN %.3fV < minimum %.3fV", snapshot->read_vin,
+            limits.input_voltage_min_v);
     }
 
     if (snapshot->read_vin >= limits.input_voltage_max_v) {
-        return fail_regulator_safety(state, "input voltage at or above configured limit",
-                                     snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VIN %.3fV >= maximum %.3fV", snapshot->read_vin,
+            limits.input_voltage_max_v);
     }
 
     if (snapshot->read_vout < limits.asic_voltage_min_v) {
-        return fail_regulator_safety(state,
-                                     "ASIC voltage below configured limit while output is enabled",
-                                     snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VOUT %.3fV < minimum %.3fV while enabled", snapshot->read_vout,
+            limits.asic_voltage_min_v);
     }
 
     if (snapshot->read_vout >= limits.asic_voltage_max_v) {
-        return fail_regulator_safety(state, "ASIC voltage at or above configured limit",
-                                     snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VOUT %.3fV >= maximum %.3fV", snapshot->read_vout,
+            limits.asic_voltage_max_v);
     }
 
     if (require_target_vout && fabsf(snapshot->read_vout - target_vout) > TPS546_VOUT_TOLERANCE_VOLTS) {
-        return fail_regulator_safety(state, "TPS546 VOUT outside tolerance", snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VOUT %.3fV; target %.3fV +/- %.3fV", snapshot->read_vout, target_vout,
+            TPS546_VOUT_TOLERANCE_VOLTS);
     }
 
     if ((float)snapshot->read_temp1 >= limits.tps546_temp_max_c) {
-        return fail_regulator_safety(state, "TPS546 temperature at or above configured limit",
-                                     snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VR temperature %dC >= maximum %.0fC", snapshot->read_temp1,
+            limits.tps546_temp_max_c);
     }
 
     return ESP_OK;
@@ -855,7 +902,8 @@ static esp_err_t update_asic_temperature(GlobalState *state, float *temp_c)
                      esp_err_to_name(err));
             return err;
         }
-        safety_shutdown(state, "ASIC temperature read failed");
+        safety_shutdownf(state, "ASIC temperature read failed: %s (0x%x); value unavailable",
+                         esp_err_to_name(err), (unsigned)err);
         return err;
     }
 
@@ -880,7 +928,7 @@ static esp_err_t update_asic_temperature(GlobalState *state, float *temp_c)
             ESP_LOGW(TAG, "ignoring startup ASIC temperature invalid");
             return ESP_ERR_INVALID_STATE;
         }
-        safety_shutdown(state, "ASIC temperature invalid");
+        safety_shutdownf(state, "ASIC temperature invalid: %gC (non-finite)", (double)*temp_c);
         return ESP_FAIL;
     }
 
@@ -894,7 +942,8 @@ static esp_err_t update_asic_temperature(GlobalState *state, float *temp_c)
         }
         ESP_LOGE(TAG, "ASIC temperature %.1f C reached shutdown limit %.1f C", *temp_c,
                  asic_temp_shutdown_c);
-        safety_shutdown(state, "ASIC temperature at or above configured limit");
+        safety_shutdownf(state, "ASIC temperature %.1fC >= maximum %.1fC",
+                         *temp_c, asic_temp_shutdown_c);
         return ESP_FAIL;
     }
 
@@ -956,7 +1005,8 @@ static esp_err_t apply_temperature_voltage_compensation(GlobalState *state, floa
 
 static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
                                           float control_temp_c,
-                                          const TPS546_StatusSnapshot *snapshot)
+                                          const TPS546_StatusSnapshot *snapshot,
+                                          const TPS546_StatusSnapshot *raw_snapshot)
 {
     const m45_config_t active_config = *m45_config_get();
     const m45_config_t *config = &active_config;
@@ -968,7 +1018,9 @@ static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
         current_auto_clock_voltage_mv(config, asic_temp_c);
     if (!config->auto_clock_enabled || !active || state->SYSTEM_MODULE.hardware_fault ||
         !isfinite(asic_temp_c) || asic_temp_c <= 0.0f ||
-        !isfinite(control_temp_c) || control_temp_c <= 0.0f || snapshot == NULL) {
+        !isfinite(control_temp_c) || control_temp_c <= 0.0f || snapshot == NULL ||
+        raw_snapshot == NULL) {
+        memset(&g_auto_clock_voltage, 0, sizeof(g_auto_clock_voltage));
         g_auto_clock_up_dwell_ticks = 0;
         g_auto_clock_down_dwell_ticks = 0;
         update_auto_clock_status(config->auto_clock_enabled, false, current_frequency_mhz,
@@ -979,20 +1031,50 @@ static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
         return ESP_OK;
     }
 
+    // Check raw VIN every monitor pass, before either the startup gate or the
+    // five-second thermal-control cadence. The lower of raw/averaged VIN wins.
+    const m45_auto_clock_voltage_result_t voltage = m45_auto_clock_voltage_update(
+        &g_auto_clock_voltage, raw_snapshot->read_vin, snapshot->read_vin,
+        config->safety_input_voltage_min_mv / 1000.0f,
+        config->safety_input_voltage_expected_min_mv / 1000.0f,
+        (uint64_t)esp_timer_get_time() / 1000ULL);
+    char voltage_reason[96] = "";
+    if (voltage.limited) {
+        g_auto_clock_up_dwell_ticks = 0;
+        if (voltage.valid) {
+            snprintf(voltage_reason, sizeof(voltage_reason),
+                     "TPS VIN %.3fV; guard %.3fV; resume >= %.3fV for 5s",
+                     voltage.vin, voltage.guard_v, voltage.resume_v);
+        } else {
+            snprintf(voltage_reason, sizeof(voltage_reason), "TPS VIN unavailable; holding clock/voltage");
+        }
+    }
+    // Publish promptly even between control ticks; never hide VIN behind an
+    // ASIC temperature or current notice.
+    portENTER_CRITICAL(&g_auto_clock_status_lock);
+    if (voltage.limited || g_auto_clock_status.input_voltage_limited) {
+        strlcpy(g_auto_clock_status.hold_reason, voltage_reason,
+                sizeof(g_auto_clock_status.hold_reason));
+    }
+    g_auto_clock_status.input_voltage_limited = voltage.limited;
+    portEXIT_CRITICAL(&g_auto_clock_status_lock);
+
     const char *mining_wait_reason = NULL;
-    if (!auto_clock_startup_gate_ready(&mining_wait_reason)) {
+    if ((!auto_clock_startup_gate_ready(&mining_wait_reason) && !voltage.backoff) ||
+        !voltage.valid) {
         g_auto_clock_up_dwell_ticks = 0;
         g_auto_clock_down_dwell_ticks = 0;
         update_auto_clock_status(true, false, current_frequency_mhz, current_voltage_mv,
-                                 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, false,
+                                 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, voltage.limited, false,
                                  false, false, false,
-                                 mining_wait_reason != NULL ? mining_wait_reason
-                                                             : "waiting for mining telemetry");
+                                 voltage.limited ? voltage_reason :
+                                 (mining_wait_reason != NULL ? mining_wait_reason
+                                                              : "waiting for mining telemetry"));
         return ESP_OK;
     }
 
     const TickType_t now = xTaskGetTickCount();
-    if (g_auto_clock_next_tick != 0 &&
+    if (!voltage.backoff && g_auto_clock_next_tick != 0 &&
         (int32_t)(now - g_auto_clock_next_tick) < 0) {
         return ESP_OK;
     }
@@ -1011,8 +1093,9 @@ static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
         g_auto_clock_up_dwell_ticks = 0;
         g_auto_clock_down_dwell_ticks = 0;
         update_auto_clock_status(true, false, current_frequency_mhz, current_voltage_mv,
-                                 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, false,
-                                 false, false, false, "waiting for power telemetry");
+                                 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, voltage.limited, false,
+                                 false, false, false,
+                                 voltage.limited ? voltage_reason : "waiting for power telemetry");
         return ESP_OK;
     }
 
@@ -1035,13 +1118,11 @@ static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
         current_ceiling_a > 0.0f && i_now >= current_ceiling_a;
     const bool vr_temp_near_limit =
         vr_temp_ceiling_c > 0.0f && vr_temp_c >= vr_temp_ceiling_c;
-    const bool vin_low_for_upshift = isfinite(snapshot->read_vin) &&
-                                     snapshot->read_vin > 0.0f &&
-                                     snapshot->read_vin <= AUTO_CLOCK_UP_VIN_MIN_V;
+    const bool vin_low_for_upshift = voltage.limited;
     const bool upshift_blocked_by_limits =
         current_near_limit || vr_temp_near_limit || vin_low_for_upshift;
     const bool current_power_over_limit = max_power_enabled && p_now > max_power_w;
-    bool input_voltage_limited = false;
+    bool input_voltage_limited = voltage.limited;
     bool output_current_limited = false;
     bool vr_temp_limited = false;
     bool power_limited = false;
@@ -1112,7 +1193,8 @@ static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
                 max_watts_limited = true;
             }
         }
-        if (candidate_current_limited) {
+        if (candidate_current_limited ||
+            (voltage.limited && candidate_voltage_mv > current_voltage_mv)) {
             continue;
         }
         if (upshift_candidate && upshift_blocked_by_limits) {
@@ -1131,8 +1213,8 @@ static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
         update_auto_clock_status(true, false, current_frequency_mhz,
                                  current_voltage_mv,
                                  0, p_now, p_target, 0.0f, current_ceiling_a, 0.0f,
-                                 false, false, false, false, false,
-                                 "no preset fits voltage safety limits");
+                                 voltage.limited, false, false, false, false,
+                                 voltage.limited ? voltage_reason : "no preset fits voltage safety limits");
         return ESP_ERR_INVALID_ARG;
     }
     if (!have_target) {
@@ -1174,7 +1256,6 @@ static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
         target_index = control_current_index;
     }
     if (control_temp_c >= target_temp_c - AUTO_CLOCK_UP_TEMP_HYSTERESIS_C) {
-        input_voltage_limited = false;
         output_current_limited = false;
         vr_temp_limited = false;
         power_limited = false;
@@ -1185,6 +1266,13 @@ static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
     if (current_power_over_limit && target_index < control_current_index) {
         urgent_downshift = true;
         max_steps_down = AUTO_CLOCK_MAX_STEPS_DOWN_HOT;
+    }
+    if (voltage.backoff) {
+        // Reduce load now rather than waiting for the thermal dwell. A fresh
+        // request is rate-limited to once a second while VIN remains low.
+        urgent_downshift = true;
+        target_index = lowest_valid_index;
+        max_steps_down = AUTO_CLOCK_MAX_STEPS_DOWN;
     }
     if (target_index < lowest_valid_index) {
         target_index = lowest_valid_index;
@@ -1217,25 +1305,44 @@ static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
         g_auto_clock_up_dwell_ticks = 0;
         g_auto_clock_down_dwell_ticks = 0;
     }
-    const uint16_t next_frequency_mhz = auto_clock_preset_frequency(next_index);
+    uint16_t next_frequency_mhz = auto_clock_preset_frequency(next_index);
     uint16_t next_base_mv = 0;
     uint16_t next_voltage_mv = 0;
-    if (!auto_clock_candidate_voltage(config, next_frequency_mhz, asic_temp_c,
-                                      &next_base_mv, &next_voltage_mv)) {
+    bool next_valid = auto_clock_candidate_voltage(config, next_frequency_mhz, asic_temp_c,
+                                                    &next_base_mv, &next_voltage_mv);
+    // A lower frequency can have a higher preset voltage (notably 525 MHz).
+    // Never raise either setting while input voltage is limited. Skip such
+    // presets rather than increasing load during a voltage-driven downshift.
+    while (voltage.limited && (!next_valid || next_voltage_mv > current_voltage_mv ||
+                               next_frequency_mhz > current_frequency_mhz) &&
+           next_index > lowest_valid_index) {
+        --next_index;
+        next_frequency_mhz = auto_clock_preset_frequency(next_index);
+        next_valid = auto_clock_candidate_voltage(config, next_frequency_mhz, asic_temp_c,
+                                                   &next_base_mv, &next_voltage_mv);
+    }
+    if (voltage.limited && (!next_valid || next_voltage_mv > current_voltage_mv ||
+                            next_frequency_mhz > current_frequency_mhz)) {
+        next_frequency_mhz = current_frequency_mhz;
+        next_voltage_mv = next_base_mv = current_voltage_mv;
+        next_valid = true;
+    }
+    if (!next_valid) {
         update_auto_clock_status(true, false, current_frequency_mhz,
                                  current_voltage_mv,
                                  next_up_frequency_mhz, p_now, p_target, next_up_power_w,
-                                 current_ceiling_a, next_up_output_current_a, false, false,
-                                 false, false, false, "next preset outside voltage limits");
+                                 current_ceiling_a, next_up_output_current_a, voltage.limited, false,
+                                 false, false, false,
+                                 voltage.limited ? voltage_reason : "next preset outside voltage limits");
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (target_base_mv == 0 || target_voltage_mv == 0) {
-        auto_clock_candidate_voltage(config, auto_clock_preset_frequency(target_index),
-                                     asic_temp_c, &target_base_mv, &target_voltage_mv);
-    }
+    auto_clock_candidate_voltage(config, auto_clock_preset_frequency(target_index),
+                                 asic_temp_c, &target_base_mv, &target_voltage_mv);
     char hold_reason[96] = "";
-    if (next_frequency_mhz <= current_frequency_mhz) {
+    if (voltage.limited) {
+        strlcpy(hold_reason, voltage_reason, sizeof(hold_reason));
+    } else if (next_frequency_mhz <= current_frequency_mhz) {
         if (dwell_limited) {
             snprintf(hold_reason, sizeof(hold_reason), "waiting for stable trend");
         } else if (temperature_limited) {
@@ -1248,9 +1355,6 @@ static esp_err_t apply_auto_clock_control(GlobalState *state, float asic_temp_c,
                      "IOUT ceiling %.1f A; next %u MHz estimates %.1f A",
                      current_ceiling_a, next_up_frequency_mhz,
                      next_up_output_current_a);
-        } else if (input_voltage_limited) {
-            snprintf(hold_reason, sizeof(hold_reason),
-                     "VIN %.2f V is too low for an upshift", snapshot->read_vin);
         } else if (vr_temp_limited) {
             snprintf(hold_reason, sizeof(hold_reason),
                      "VR temp %.0f C is near %.0f C ceiling",
@@ -1487,35 +1591,48 @@ static esp_err_t validate_regulator_startup_snapshot(GlobalState *state,
 
     const uint16_t startup_fault_mask = TPS546_STATUS_FAULT_MASK & ~TPS546_STATUS_PGOOD;
     if (snapshot->status_word & startup_fault_mask) {
-        return fail_regulator_safety(state, "TPS546 status fault during startup", snapshot);
+        return fail_regulator_safety(
+            state, snapshot,
+            "TPS546 startup status fault (limits: VIN %.3f-%.3fV, IOUT warn/fault %.1f/%.1fA, VR %.0fC)",
+            limits.input_voltage_min_v, limits.input_voltage_max_v, limits.iout_warn_a, limits.iout_fault_a,
+            limits.tps546_temp_max_c);
     }
 
     if ((snapshot->status_word & TPS546_STATUS_INPUT) &&
         (snapshot->st_input & TPS546_STATUS_VIN_OVF)) {
-        return fail_regulator_safety(state, "TPS546 VIN overvoltage fault", snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VIN overvoltage flag; configured limit %.3fV",
+            limits.input_voltage_max_v);
     }
 
     if ((snapshot->operation & OPERATION_ON) == 0) {
-        return fail_regulator_safety(state, "TPS546 operation bit is not ON", snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 operation is not ON: OP=0x%02x, expected ON bit=0x%02x",
+            snapshot->operation, OPERATION_ON);
     }
 
     if (snapshot->read_vin < limits.input_voltage_min_v) {
-        return fail_regulator_safety(state, "TPS546 VIN below configured limit", snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VIN %.3fV < minimum %.3fV", snapshot->read_vin,
+            limits.input_voltage_min_v);
     }
 
     if (snapshot->read_vin >= limits.input_voltage_max_v) {
-        return fail_regulator_safety(state, "input voltage at or above configured limit",
-                                     snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VIN %.3fV >= maximum %.3fV", snapshot->read_vin,
+            limits.input_voltage_max_v);
     }
 
     if (snapshot->read_vout >= limits.asic_voltage_max_v) {
-        return fail_regulator_safety(state, "ASIC voltage at or above configured limit",
-                                     snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VOUT %.3fV >= maximum %.3fV", snapshot->read_vout,
+            limits.asic_voltage_max_v);
     }
 
     if ((float)snapshot->read_temp1 >= limits.tps546_temp_max_c) {
-        return fail_regulator_safety(state, "TPS546 temperature at or above configured limit",
-                                     snapshot);
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 VR temperature %dC >= maximum %.0fC", snapshot->read_temp1,
+            limits.tps546_temp_max_c);
     }
 
     if (snapshot->read_vout >= limits.asic_voltage_min_v &&
@@ -1537,7 +1654,7 @@ static esp_err_t wait_for_regulator_after_enable(GlobalState *state, float targe
         TPS546_StatusSnapshot snapshot;
         esp_err_t err = capture_power_snapshot(&snapshot);
         if (err != ESP_OK) {
-            safety_shutdown(state, "TPS546 validation read failed");
+            (void)fail_regulator_safety(state, &snapshot, "TPS546 validation read failed");
             return err;
         }
         update_power_state(state, &snapshot);
@@ -1557,8 +1674,10 @@ static esp_err_t wait_for_regulator_after_enable(GlobalState *state, float targe
         }
 
         if ((xTaskGetTickCount() - started) >= timeout_ticks) {
-            return fail_regulator_safety(state, "TPS546 VOUT did not settle after enable",
-                                         &snapshot);
+            return fail_regulator_safety(
+                state, &snapshot, "TPS546 VOUT %.3fV did not settle to %.3fV +/- %.3fV within %ums",
+                snapshot.read_vout, target_vout, TPS546_VOUT_TOLERANCE_VOLTS,
+                TPS546_OUTPUT_SETTLE_TIMEOUT_MS);
         }
 
         vTaskDelay(pdMS_TO_TICKS(TPS546_OUTPUT_SETTLE_POLL_MS));
@@ -1581,7 +1700,7 @@ static void power_monitor_task(void *arg)
             if (!g_regulator_enabled) {
                 continue;
             }
-            safety_shutdown(state, "TPS546 monitor read failed");
+            (void)fail_regulator_safety(state, &snapshot, "TPS546 monitor read failed");
             continue;
         }
 
@@ -1633,7 +1752,7 @@ static void power_monitor_task(void *arg)
             const float control_temp_c = bitaxe_fan_control_temp_c(asic_temp_c);
             if (mining_started) {
                 if (apply_auto_clock_control(state, asic_temp_c, control_temp_c,
-                                             &averaged_snapshot) != ESP_OK) {
+                                             &averaged_snapshot, &snapshot) != ESP_OK) {
                     ESP_LOGW(TAG, "auto clock control update failed");
                 }
             } else {

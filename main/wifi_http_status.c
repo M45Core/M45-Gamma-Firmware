@@ -24,7 +24,7 @@ typedef struct {
     char wifi_ssid[80];
     char device_name[512];
     char pool_host[160];
-    char hardware_fault_msg[96];
+    char hardware_fault_msg[2048];
     char imported_board_version[32];
     char auto_clock_hold_reason[128];
     char tps546_model[24];
@@ -36,6 +36,12 @@ typedef struct {
     char asic_loss_json[1024];
 #endif
 } status_handler_scratch_t;
+
+_Static_assert(sizeof(((status_handler_scratch_t *)0)->hardware_fault_msg) >=
+               2 * M45_FAULT_MESSAGE_MAX + 1, "fault JSON escape capacity");
+_Static_assert(STATUS_JSON_BUFFER_SIZE >= 2 * (12288 + 2048),
+               "status response needs headroom for fault diagnostics");
+
 
 static bool format_share_events_json(status_handler_scratch_t *scratch)
 {

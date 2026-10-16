@@ -18,6 +18,9 @@
 <section id=fault-panel class='panel full fault hidden'><div class=fault-head><div class=label>Safety Shutdown</div>
 <button id=fault-close class=fault-close type=button aria-label='Dismiss safety shutdown' title=Dismiss>&times;</button></div>
 <ul id=fault-reasons class=fault-reasons></ul></section>
+<section id=voltage-limit-panel class='panel full voltage-limit hidden' role=alert>
+<div class='value small'>Overclock limited by voltage</div>
+<div id=voltage-limit-detail class=subvalue></div></section>
 <section id=refresh-warning class='panel full fault hidden'><div class=label>Connection</div>
 <div class='value small'>Unable to reach device.</div>
 <div class=subvalue>Offline for <span id=offline-time>--</span>.</div></section>
@@ -51,9 +54,12 @@
 </section></section>
 <section id=logs-view class=hidden>
 <article class='panel full fault-history'><div class=log-head><div><div class=label>Fault History</div>
-<div class=subvalue>Most recent safety shutdowns, newest first.</div></div>
+<div class=subvalue>Last eight hardware/safety faults, saved across reboots. Times use your browser time zone.</div></div>
 <button id=faults-clear class=danger type=button>Clear All</button></div>
 <div id=faults-list class=fault-history-list><div class=subvalue>Loading...</div></div></article>
+<article class='panel full fault-history'><div class=log-head><div><div class=label>Errors Since Power-on</div>
+<div id=errors-summary class=subvalue>Captured automatically, even when this page is closed. Resets on reboot.</div></div></div>
+<div id=errors-list class=fault-history-list><div class=subvalue>Loading...</div></div></article>
 <article class='panel full log-panel'><div class=log-head><div class=label>Logs</div>
 <div class=log-tools><button id=logs-save class=log-action type=button>Save Logfile</button>
 <button id=logs-copy class=log-action type=button>Copy to Clipboard</button>

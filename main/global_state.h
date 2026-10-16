@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "mining.h"
 #include "m45_config.h"
+#include "m45_fault_log.h"
 
 typedef struct {
     const char *name;
@@ -60,7 +61,7 @@ typedef struct {
     char pool_pass[M45_POOL_PASS_MAX + 1];
     uint16_t power_fault;
     bool hardware_fault;
-    char hardware_fault_msg[64];
+    char hardware_fault_msg[M45_FAULT_MESSAGE_MAX + 1];
 } SystemModule;
 
 typedef struct {

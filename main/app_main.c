@@ -25,9 +25,11 @@ static void hardware_task(void *arg)
         if (!state->SYSTEM_MODULE.hardware_fault) {
             state->SYSTEM_MODULE.hardware_fault = true;
             state->ASIC_initalized = false;
-            snprintf(state->SYSTEM_MODULE.hardware_fault_msg,
-                     sizeof(state->SYSTEM_MODULE.hardware_fault_msg),
-                     "hardware init failed: %s", esp_err_to_name(ret));
+            if (state->SYSTEM_MODULE.hardware_fault_msg[0] == '\0') {
+                snprintf(state->SYSTEM_MODULE.hardware_fault_msg,
+                         sizeof(state->SYSTEM_MODULE.hardware_fault_msg),
+                         "hardware init failed: %s (0x%x)", esp_err_to_name(ret), (unsigned)ret);
+            }
         }
         ESP_LOGE(TAG, "hardware init failed: %s", esp_err_to_name(ret));
         (void)m45_fault_log_record(state->SYSTEM_MODULE.hardware_fault_msg);

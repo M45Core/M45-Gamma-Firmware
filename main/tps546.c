@@ -488,100 +488,46 @@ esp_err_t TPS546_snapshot_status(TPS546_StatusSnapshot *snapshot)
     ESP_RETURN_ON_FALSE(snapshot != NULL, ESP_ERR_INVALID_ARG, TAG, "snapshot is NULL");
     memset(snapshot, 0, sizeof(*snapshot));
 
+    // Preserve successful reads and the exact failed command for diagnostics.
+#define SNAPSHOT_READ(field, command, expression) do { \
+    snapshot->failed_command = command; \
+    snapshot->read_error = (expression); \
+    if (snapshot->read_error != ESP_OK) return snapshot->read_error; \
+    snapshot->valid |= (1U << TPS546_FIELD_##field); \
+} while (0)
     uint16_t word = 0;
-    ESP_RETURN_ON_ERROR(tps_read_word(PMBUS_STATUS_WORD, &snapshot->status_word), TAG,
-                        "read STATUS_WORD failed");
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_STATUS_VOUT, &snapshot->st_vout), TAG,
-                        "read STATUS_VOUT failed");
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_STATUS_INPUT, &snapshot->st_input), TAG,
-                        "read STATUS_INPUT failed");
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_STATUS_IOUT, &snapshot->st_iout), TAG,
-                        "read STATUS_IOUT failed");
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_STATUS_TEMPERATURE, &snapshot->st_temp), TAG,
-                        "read STATUS_TEMPERATURE failed");
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_STATUS_CML, &snapshot->st_cml), TAG,
-                        "read STATUS_CML failed");
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_STATUS_MFR_SPECIFIC, &snapshot->st_mfr), TAG,
-                        "read STATUS_MFR_SPECIFIC failed");
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_STATUS_OTHER, &snapshot->st_other), TAG,
-                        "read STATUS_OTHER failed");
+    SNAPSHOT_READ(STATUS, PMBUS_STATUS_WORD, tps_read_word(PMBUS_STATUS_WORD, &snapshot->status_word));
+    SNAPSHOT_READ(VOUT_STATUS, PMBUS_STATUS_VOUT, tps_read_byte(PMBUS_STATUS_VOUT, &snapshot->st_vout));
+    SNAPSHOT_READ(INPUT_STATUS, PMBUS_STATUS_INPUT, tps_read_byte(PMBUS_STATUS_INPUT, &snapshot->st_input));
+    SNAPSHOT_READ(IOUT_STATUS, PMBUS_STATUS_IOUT, tps_read_byte(PMBUS_STATUS_IOUT, &snapshot->st_iout));
+    SNAPSHOT_READ(TEMP_STATUS, PMBUS_STATUS_TEMPERATURE, tps_read_byte(PMBUS_STATUS_TEMPERATURE, &snapshot->st_temp));
+    SNAPSHOT_READ(CML_STATUS, PMBUS_STATUS_CML, tps_read_byte(PMBUS_STATUS_CML, &snapshot->st_cml));
+    SNAPSHOT_READ(MFR_STATUS, PMBUS_STATUS_MFR_SPECIFIC, tps_read_byte(PMBUS_STATUS_MFR_SPECIFIC, &snapshot->st_mfr));
+    SNAPSHOT_READ(OTHER_STATUS, PMBUS_STATUS_OTHER, tps_read_byte(PMBUS_STATUS_OTHER, &snapshot->st_other));
 
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_OPERATION, &snapshot->operation), TAG,
-                        "read OPERATION failed");
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_ON_OFF_CONFIG, &snapshot->on_off_config), TAG,
-                        "read ON_OFF_CONFIG failed");
+    SNAPSHOT_READ(OPERATION, PMBUS_OPERATION, tps_read_byte(PMBUS_OPERATION, &snapshot->operation));
+    SNAPSHOT_READ(CONFIG, PMBUS_ON_OFF_CONFIG, tps_read_byte(PMBUS_ON_OFF_CONFIG, &snapshot->on_off_config));
 
-    ESP_RETURN_ON_ERROR(tps_read_word(PMBUS_VOUT_COMMAND, &word), TAG,
-                        "read VOUT_COMMAND failed");
+    SNAPSHOT_READ(COMMAND, PMBUS_VOUT_COMMAND, tps_read_word(PMBUS_VOUT_COMMAND, &word));
     snapshot->vout_command = ulinear16_to_float(word);
-    ESP_RETURN_ON_ERROR(tps_read_word(PMBUS_READ_VOUT, &word), TAG, "read READ_VOUT failed");
+    SNAPSHOT_READ(VOUT, PMBUS_READ_VOUT, tps_read_word(PMBUS_READ_VOUT, &word));
     snapshot->read_vout = ulinear16_to_float(word);
-    ESP_RETURN_ON_ERROR(tps_read_word(PMBUS_READ_VIN, &word), TAG, "read READ_VIN failed");
+    SNAPSHOT_READ(VIN, PMBUS_READ_VIN, tps_read_word(PMBUS_READ_VIN, &word));
     snapshot->read_vin = linear11_to_float(word);
-    ESP_RETURN_ON_ERROR(tps_read_word(PMBUS_READ_IOUT, &word), TAG, "read READ_IOUT failed");
+    SNAPSHOT_READ(IOUT, PMBUS_READ_IOUT, tps_read_word(PMBUS_READ_IOUT, &word));
     snapshot->read_iout = linear11_to_float(word);
-    ESP_RETURN_ON_ERROR(tps_read_word(PMBUS_READ_TEMPERATURE_1, &word), TAG,
-                        "read READ_TEMPERATURE_1 failed");
+    SNAPSHOT_READ(TEMP, PMBUS_READ_TEMPERATURE_1, tps_read_word(PMBUS_READ_TEMPERATURE_1, &word));
     snapshot->read_temp1 = linear11_to_int(word);
+
+#undef SNAPSHOT_READ
+    snapshot->failed_command = 0;
 
     return ESP_OK;
 }
 
 void TPS546_log_snapshot(const TPS546_StatusSnapshot *snapshot)
 {
-    if (snapshot == NULL) {
-        return;
-    }
-
-    ESP_LOGE(TAG,
-             "snapshot: status=0x%04x op=0x%02x cfg=0x%02x cmd=%.3f V vout=%.3f V vin=%.3f V iout=%.3f A temp=%d C",
-             snapshot->status_word, snapshot->operation, snapshot->on_off_config,
-             snapshot->vout_command, snapshot->read_vout, snapshot->read_vin,
-             snapshot->read_iout, snapshot->read_temp1);
-
-    if (snapshot->status_word & TPS546_STATUS_BUSY) {
-        ESP_LOGE(TAG, "  BUSY");
-    }
-    if (snapshot->status_word & TPS546_STATUS_OFF) {
-        ESP_LOGE(TAG, "  OFF");
-    }
-    if (snapshot->status_word & TPS546_STATUS_VOUT_OV) {
-        ESP_LOGE(TAG, "  VOUT_OV");
-    }
-    if (snapshot->status_word & TPS546_STATUS_IOUT_OC) {
-        ESP_LOGE(TAG, "  IOUT_OC");
-    }
-    if (snapshot->status_word & TPS546_STATUS_VIN_UV) {
-        ESP_LOGE(TAG, "  VIN_UV");
-    }
-    if (snapshot->status_word & TPS546_STATUS_TEMP) {
-        ESP_LOGE(TAG, "  TEMP");
-    }
-    if (snapshot->status_word & TPS546_STATUS_CML) {
-        ESP_LOGE(TAG, "  CML");
-    }
-    if (snapshot->status_word & TPS546_STATUS_PGOOD) {
-        ESP_LOGE(TAG, "  PGOOD=not in regulation");
-    }
-    if (snapshot->status_word & TPS546_STATUS_VOUT) {
-        ESP_LOGE(TAG, "  STATUS_VOUT=0x%02x", snapshot->st_vout);
-    }
-    if (snapshot->status_word & TPS546_STATUS_INPUT) {
-        ESP_LOGE(TAG, "  STATUS_INPUT=0x%02x", snapshot->st_input);
-    }
-    if (snapshot->status_word & TPS546_STATUS_IOUT) {
-        ESP_LOGE(TAG, "  STATUS_IOUT=0x%02x", snapshot->st_iout);
-    }
-    if (snapshot->status_word & TPS546_STATUS_TEMP) {
-        ESP_LOGE(TAG, "  STATUS_TEMPERATURE=0x%02x", snapshot->st_temp);
-    }
-    if (snapshot->status_word & TPS546_STATUS_CML) {
-        ESP_LOGE(TAG, "  STATUS_CML=0x%02x", snapshot->st_cml);
-    }
-    if (snapshot->status_word & TPS546_STATUS_MFR) {
-        ESP_LOGE(TAG, "  STATUS_MFR=0x%02x", snapshot->st_mfr);
-    }
-    if (snapshot->status_word & TPS546_STATUS_OTHER) {
-        ESP_LOGE(TAG, "  STATUS_OTHER=0x%02x", snapshot->st_other);
-    }
+    char message[1024];
+    TPS546_format_snapshot(snapshot, message, sizeof(message));
+    ESP_LOGE(TAG, "%s", message);
 }

@@ -6,7 +6,7 @@
 #include "esp_err.h"
 
 #define M45_FAULT_LOG_CAPACITY 8
-#define M45_FAULT_MESSAGE_MAX 95
+#define M45_FAULT_MESSAGE_MAX 1023
 
 typedef struct {
     uint32_t id;
