@@ -4,8 +4,12 @@
 - Do not create branches or push changes without explicit user permission.
 - For version changes, write release notes, changelogs, and Discord blurbs from
   the net diff between the previous published version and the new version.
-  Include only changes that remain in the final release; omit redundant
-  intermediate edits, reverted changes, and superseded approaches.
+  Every entry must describe a relevant net change between those versions.
+  Omit redundant or irrelevant entries, unchanged behavior, and statements
+  about what the firmware does not do unless that behavior actually changed.
+  Omit intermediate edits, reverted changes, and superseded approaches, even
+  if they were discussed during development. Compare the released versions,
+  not the conversation history or sequence of implementation steps.
 - When adding or expanding web pages, HTTP routes, or JSON fields, audit every
   related fixed-size capacity. In particular, check HTTP handler slots, request
   and response buffers, task stacks, lwIP socket concurrency, generated web
