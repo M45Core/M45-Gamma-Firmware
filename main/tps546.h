@@ -114,6 +114,7 @@ esp_err_t TPS546_init(TPS546_CONFIG config);
 esp_err_t TPS546_apply_limits(TPS546_CONFIG config);
 esp_err_t TPS546_set_vout(float volts);
 esp_err_t TPS546_clear_faults(void);
+void TPS546_set_read_event_callback(void (*callback)(void *, const char *), void *context);
 esp_err_t TPS546_snapshot_status(TPS546_StatusSnapshot *snapshot);
 const char *TPS546_model(void);
 void TPS546_log_snapshot(const TPS546_StatusSnapshot *snapshot);

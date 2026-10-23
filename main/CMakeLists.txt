@@ -48,6 +48,7 @@ idf_component_register(
         "m45_auto_clock_voltage.c"
         "m45_backup_pools.c"
         "m45_fault_log.c"
+        "m45_fault_context.c"
         "m45_error_log.c"
         "m45_log_buffer.c"
         "mining.c"

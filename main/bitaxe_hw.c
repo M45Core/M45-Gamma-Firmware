@@ -21,6 +21,7 @@
 #include "m45_config.h"
 #include "m45_auto_clock_voltage.h"
 #include "m45_fault_log.h"
+#include "m45_fault_context.h"
 #include "mining.h"
 #include "asic_serial.h"
 #include "stratum_minimal.h"
@@ -35,13 +36,16 @@
 #define TPS546_VOUT_TOLERANCE_VOLTS 0.075f
 #define TPS546_MONITOR_INTERVAL_MS 250
 #define ASIC_FAN_MONITOR_INTERVAL_MS 250
-#define TPS546_POWER_MONITOR_STACK_BYTES 8192
+// Auto-clock retains configuration frames while a TPS update retries reads and
+// persists diagnostics. Leave headroom for the driver, logging, and NVS calls.
+#define TPS546_POWER_MONITOR_STACK_BYTES 16384
 #define TPS546_POWER_WINDOW_SAMPLES 16
 #define TPS546_OUTPUT_SETTLE_INITIAL_MS 20
 #define TPS546_OUTPUT_SETTLE_POLL_MS 10
 #define TPS546_OUTPUT_SETTLE_TIMEOUT_MS 300
 #define ASIC_FREQUENCY_SETTLE_MS 50
 #define ASIC_POWER_OFF_MIN_MS 1000
+#define ASIC_RX_DRAIN_TIMEOUT_MS 11000
 #define ASIC_TEMP_STARTUP_GRACE_MS 3000
 #define ASIC_TEMP_NO_READING_C 127.0f
 #define ASIC_TEMP_NO_READING_LOG_MS 5000
@@ -92,6 +96,12 @@ static uint32_t g_mining_gate_valid_nonce_baseline;
 static portMUX_TYPE g_power_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_auto_clock_status_lock = portMUX_INITIALIZER_UNLOCKED;
 static bitaxe_gamma602_power_snapshot_t g_power_snapshot = {0};
+// Diagnostic samples outlive a power transition; their ages distinguish old
+// readings from a current measurement when a restart/read attempt fails.
+static m45_fault_context_t g_fault_context;
+_Static_assert(M45_FAULT_MESSAGE_MAX + 1 >=
+                   M45_FAULT_CONTEXT_BYTES + M45_FAULT_REASON_MIN_BYTES,
+               "fault record must fit the cause and operating context");
 static bitaxe_gamma602_auto_clock_status_t g_auto_clock_status = {
     .thermal_resistance_c_per_w = AUTO_CLOCK_THERMAL_R_C_PER_W,
 };
@@ -211,6 +221,28 @@ static esp_err_t asic_reset_pulse(void)
     ESP_RETURN_ON_ERROR(gpio_set_level(ASIC_RESET_GPIO, 1), TAG, "reset high failed");
     vTaskDelay(pdMS_TO_TICKS(100));
     return ESP_OK;
+}
+
+static void remember_fault_power_sample(const TPS546_StatusSnapshot *snapshot)
+{
+    if (snapshot->read_error != ESP_OK ||
+        snapshot->valid != TPS546_SNAPSHOT_ALL_VALID) {
+        return;
+    }
+    const uint64_t now_ms = (uint64_t)esp_timer_get_time() / 1000;
+    portENTER_CRITICAL(&g_power_snapshot_lock);
+    m45_fault_context_remember_power(&g_fault_context, now_ms, snapshot->read_vin,
+                                     snapshot->read_vout, snapshot->read_iout,
+                                     (float)snapshot->read_temp1);
+    portEXIT_CRITICAL(&g_power_snapshot_lock);
+}
+
+static void remember_fault_asic_temperature(float temp_c)
+{
+    const uint64_t now_ms = (uint64_t)esp_timer_get_time() / 1000;
+    portENTER_CRITICAL(&g_power_snapshot_lock);
+    m45_fault_context_remember_asic_temp(&g_fault_context, now_ms, temp_c);
+    portEXIT_CRITICAL(&g_power_snapshot_lock);
 }
 
 static void store_power_snapshot(const TPS546_StatusSnapshot *snapshot)
@@ -676,8 +708,21 @@ static esp_err_t auto_clock_apply_preset(GlobalState *state, const m45_config_t 
     return ESP_OK;
 }
 
+static void remember_fault_operating_settings(GlobalState *state)
+{
+    const uint64_t now_ms = (uint64_t)esp_timer_get_time() / 1000;
+    const uint16_t requested_mv = m45_config_effective_asic_voltage_mv(m45_config_get());
+    portENTER_CRITICAL(&g_power_snapshot_lock);
+    m45_fault_context_remember_settings(&g_fault_context, now_ms,
+                                        state->POWER_MANAGEMENT_MODULE.actual_frequency,
+                                        state->POWER_MANAGEMENT_MODULE.frequency_value,
+                                        requested_mv, g_commanded_voltage_mv);
+    portEXIT_CRITICAL(&g_power_snapshot_lock);
+}
+
 static void update_power_state(GlobalState *state, const TPS546_StatusSnapshot *snapshot)
 {
+    remember_fault_operating_settings(state);
     state->POWER_MANAGEMENT_MODULE.voltage = snapshot->read_vin;
     state->POWER_MANAGEMENT_MODULE.current = snapshot->read_iout;
     state->POWER_MANAGEMENT_MODULE.core_voltage = snapshot->read_vout;
@@ -715,18 +760,10 @@ static void update_power_average(const TPS546_StatusSnapshot *raw, TPS546_Status
     averaged->read_temp1 = (int)lroundf(g_power_temp_sum / samples);
 }
 
-static esp_err_t capture_power_snapshot(TPS546_StatusSnapshot *snapshot)
-{
-    memset(snapshot, 0, sizeof(*snapshot));
-    ESP_RETURN_ON_ERROR(TPS546_snapshot_status(snapshot), TAG, "TPS546 snapshot failed");
-    store_power_snapshot(snapshot);
-    return ESP_OK;
-}
 
 static esp_err_t shutdown_regulator(GlobalState *state, const char *reason)
 {
     ESP_LOGE(TAG, "%s; turning TPS546 output off", reason);
-    bitaxe_fan_force_max_if_allowed(state, reason);
     set_hw_status("regulator shutdown");
     g_regulator_enabled = false;
     g_commanded_voltage_mv = 0;
@@ -739,6 +776,9 @@ static esp_err_t shutdown_regulator(GlobalState *state, const char *reason)
         ESP_LOGW(TAG, "failed to hold ASIC reset low during regulator shutdown: %s",
                  esp_err_to_name(reset_err));
     }
+
+    // Stop the ASIC before any I2C access, which can wait for bus retries.
+    bitaxe_fan_force_max_if_allowed(state, reason);
 
     if (!g_tps546_ready) {
         record_asic_power_off();
@@ -759,8 +799,39 @@ static void flag_safety_fault(GlobalState *state, const char *reason)
     bitaxe_gamma602_clear_jobs(state);
 }
 
-static void safety_shutdown(GlobalState *state, const char *reason)
+static void format_fault_context(GlobalState *state, const char *reason,
+                                  char *dst, size_t size)
 {
+    remember_fault_operating_settings(state);
+    m45_fault_context_t context;
+    portENTER_CRITICAL(&g_power_snapshot_lock);
+    context = g_fault_context;
+    portEXIT_CRITICAL(&g_power_snapshot_lock);
+    if (!context.operating_settings_valid) {
+        context.requested_frequency_mhz = state->POWER_MANAGEMENT_MODULE.frequency_value;
+        context.requested_voltage_mv =
+            m45_config_effective_asic_voltage_mv(m45_config_get());
+    }
+    m45_fault_context_format(&context, (uint64_t)esp_timer_get_time() / 1000,
+                             reason, dst, size);
+}
+
+void bitaxe_gamma602_log_read_retry(GlobalState *state, const char *reason)
+{
+    if (state == NULL || reason == NULL) {
+        return;
+    }
+    char message[M45_FAULT_MESSAGE_MAX + 1];
+    format_fault_context(state, reason, message, sizeof(message));
+    ESP_LOGW(TAG, "%s", message);
+    (void)m45_fault_log_record(message);
+}
+
+static void safety_shutdown(GlobalState *state, char *reason, size_t reason_size)
+{
+    // Both callers own a full-size mutable fault buffer, so enrich in place
+    // before shutdown clears telemetry without another 1 KiB stack allocation.
+    format_fault_context(state, reason, reason, reason_size);
     flag_safety_fault(state, reason);
     esp_err_t shutdown_err = shutdown_regulator(state, reason);
     if (shutdown_err != ESP_OK) {
@@ -780,19 +851,22 @@ static void safety_shutdownf(GlobalState *state, const char *fmt, ...)
     va_start(args, fmt);
     vsnprintf(message, sizeof(message), fmt, args);
     va_end(args);
-    safety_shutdown(state, message);
+    safety_shutdown(state, message, sizeof(message));
 }
 
 static esp_err_t shutdown_and_return(GlobalState *state, const char *reason, esp_err_t result)
 {
-    char message[256];
+    char message[M45_FAULT_MESSAGE_MAX + 1];
     snprintf(message, sizeof(message), "%s: %s (0x%x)", reason,
              esp_err_to_name(result), (unsigned)result);
+    format_fault_context(state, message, message, sizeof(message));
     // Keep the failing stage instead of replacing it with "hardware init failed".
     if (!state->SYSTEM_MODULE.hardware_fault) {
         strlcpy(state->SYSTEM_MODULE.hardware_fault_msg, message,
                 sizeof(state->SYSTEM_MODULE.hardware_fault_msg));
     }
+    state->ASIC_initalized = false;
+    bitaxe_gamma602_clear_jobs(state);
     esp_err_t shutdown_err = shutdown_regulator(state, message);
     if (shutdown_err != ESP_OK) {
         ESP_LOGE(TAG, "regulator shutdown failed after %s: %s (0x%x)", message,
@@ -815,7 +889,7 @@ static esp_err_t fail_regulator_safety(GlobalState *state,
     snprintf(message + used, sizeof(message) - used, "; ");
     used = strlen(message);
     TPS546_format_snapshot(snapshot, message + used, sizeof(message) - used);
-    safety_shutdown(state, message);
+    safety_shutdown(state, message, sizeof(message));
     return ESP_FAIL;
 }
 
@@ -827,7 +901,8 @@ static esp_err_t validate_regulator_safety(GlobalState *state,
     bitaxe_gamma602_safety_limits_t limits;
     bitaxe_gamma602_safety_limits(&limits);
 
-    if (snapshot->status_word & TPS546_STATUS_FAULT_MASK) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_STATUS)) &&
+        (snapshot->status_word & TPS546_STATUS_FAULT_MASK)) {
         return fail_regulator_safety(
             state, snapshot,
             "TPS546 status fault (limits: VIN %.3f-%.3fV, IOUT warn/fault %.1f/%.1fA, VR %.0fC)",
@@ -835,53 +910,69 @@ static esp_err_t validate_regulator_safety(GlobalState *state,
             limits.tps546_temp_max_c);
     }
 
-    if ((snapshot->status_word & TPS546_STATUS_INPUT) &&
+    if ((snapshot->valid & (1U << TPS546_FIELD_STATUS)) &&
+        (snapshot->valid & (1U << TPS546_FIELD_INPUT_STATUS)) &&
+        (snapshot->status_word & TPS546_STATUS_INPUT) &&
         (snapshot->st_input & TPS546_STATUS_VIN_OVF)) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VIN overvoltage flag; configured limit %.3fV",
             limits.input_voltage_max_v);
     }
 
-    if ((snapshot->operation & OPERATION_ON) == 0) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_OPERATION)) &&
+        (snapshot->operation & OPERATION_ON) == 0) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 operation is not ON: OP=0x%02x, expected ON bit=0x%02x",
             snapshot->operation, OPERATION_ON);
     }
 
-    if (snapshot->read_vin < limits.input_voltage_min_v) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_VIN)) &&
+        snapshot->read_vin < limits.input_voltage_min_v) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VIN %.3fV < minimum %.3fV", snapshot->read_vin,
             limits.input_voltage_min_v);
     }
 
-    if (snapshot->read_vin >= limits.input_voltage_max_v) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_VIN)) &&
+        snapshot->read_vin >= limits.input_voltage_max_v) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VIN %.3fV >= maximum %.3fV", snapshot->read_vin,
             limits.input_voltage_max_v);
     }
 
-    if (snapshot->read_vout < limits.asic_voltage_min_v) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_VOUT)) &&
+        snapshot->read_vout < limits.asic_voltage_min_v) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VOUT %.3fV < minimum %.3fV while enabled", snapshot->read_vout,
             limits.asic_voltage_min_v);
     }
 
-    if (snapshot->read_vout >= limits.asic_voltage_max_v) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_VOUT)) &&
+        snapshot->read_vout >= limits.asic_voltage_max_v) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VOUT %.3fV >= maximum %.3fV", snapshot->read_vout,
             limits.asic_voltage_max_v);
     }
 
-    if (require_target_vout && fabsf(snapshot->read_vout - target_vout) > TPS546_VOUT_TOLERANCE_VOLTS) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_VOUT)) && require_target_vout &&
+        fabsf(snapshot->read_vout - target_vout) > TPS546_VOUT_TOLERANCE_VOLTS) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VOUT %.3fV; target %.3fV +/- %.3fV", snapshot->read_vout, target_vout,
             TPS546_VOUT_TOLERANCE_VOLTS);
     }
 
-    if ((float)snapshot->read_temp1 >= limits.tps546_temp_max_c) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_TEMP)) &&
+        (float)snapshot->read_temp1 >= limits.tps546_temp_max_c) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VR temperature %dC >= maximum %.0fC", snapshot->read_temp1,
             limits.tps546_temp_max_c);
+    }
+
+    if ((snapshot->valid & (1U << TPS546_FIELD_IOUT)) &&
+        snapshot->read_iout >= limits.iout_fault_a) {
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 IOUT %.3fA >= maximum %.3fA", snapshot->read_iout,
+            limits.iout_fault_a);
     }
 
     return ESP_OK;
@@ -932,6 +1023,7 @@ static esp_err_t update_asic_temperature(GlobalState *state, float *temp_c)
         return ESP_FAIL;
     }
 
+    remember_fault_asic_temperature(*temp_c);
     const float asic_temp_shutdown_c =
         (float)m45_config_get()->safety_asic_temp_max_c;
     if (*temp_c >= asic_temp_shutdown_c) {
@@ -975,6 +1067,7 @@ static bool read_asic_temp_for_voltage(GlobalState *state, float *temp_c)
         return false;
     }
 
+    remember_fault_asic_temperature(raw_temp_c);
     state->POWER_MANAGEMENT_MODULE.chip_temp_avg = raw_temp_c;
     *temp_c = raw_temp_c;
     return true;
@@ -1590,7 +1683,8 @@ static esp_err_t validate_regulator_startup_snapshot(GlobalState *state,
     bitaxe_gamma602_safety_limits(&limits);
 
     const uint16_t startup_fault_mask = TPS546_STATUS_FAULT_MASK & ~TPS546_STATUS_PGOOD;
-    if (snapshot->status_word & startup_fault_mask) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_STATUS)) &&
+        (snapshot->status_word & startup_fault_mask)) {
         return fail_regulator_safety(
             state, snapshot,
             "TPS546 startup status fault (limits: VIN %.3f-%.3fV, IOUT warn/fault %.1f/%.1fA, VR %.0fC)",
@@ -1598,49 +1692,143 @@ static esp_err_t validate_regulator_startup_snapshot(GlobalState *state,
             limits.tps546_temp_max_c);
     }
 
-    if ((snapshot->status_word & TPS546_STATUS_INPUT) &&
+    if ((snapshot->valid & (1U << TPS546_FIELD_STATUS)) &&
+        (snapshot->valid & (1U << TPS546_FIELD_INPUT_STATUS)) &&
+        (snapshot->status_word & TPS546_STATUS_INPUT) &&
         (snapshot->st_input & TPS546_STATUS_VIN_OVF)) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VIN overvoltage flag; configured limit %.3fV",
             limits.input_voltage_max_v);
     }
 
-    if ((snapshot->operation & OPERATION_ON) == 0) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_OPERATION)) &&
+        (snapshot->operation & OPERATION_ON) == 0) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 operation is not ON: OP=0x%02x, expected ON bit=0x%02x",
             snapshot->operation, OPERATION_ON);
     }
 
-    if (snapshot->read_vin < limits.input_voltage_min_v) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_VIN)) &&
+        snapshot->read_vin < limits.input_voltage_min_v) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VIN %.3fV < minimum %.3fV", snapshot->read_vin,
             limits.input_voltage_min_v);
     }
 
-    if (snapshot->read_vin >= limits.input_voltage_max_v) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_VIN)) &&
+        snapshot->read_vin >= limits.input_voltage_max_v) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VIN %.3fV >= maximum %.3fV", snapshot->read_vin,
             limits.input_voltage_max_v);
     }
 
-    if (snapshot->read_vout >= limits.asic_voltage_max_v) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_VOUT)) &&
+        snapshot->read_vout >= limits.asic_voltage_max_v) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VOUT %.3fV >= maximum %.3fV", snapshot->read_vout,
             limits.asic_voltage_max_v);
     }
 
-    if ((float)snapshot->read_temp1 >= limits.tps546_temp_max_c) {
+    if ((snapshot->valid & (1U << TPS546_FIELD_TEMP)) &&
+        (float)snapshot->read_temp1 >= limits.tps546_temp_max_c) {
         return fail_regulator_safety(
             state, snapshot, "TPS546 VR temperature %dC >= maximum %.0fC", snapshot->read_temp1,
             limits.tps546_temp_max_c);
     }
 
-    if (snapshot->read_vout >= limits.asic_voltage_min_v &&
+    if ((snapshot->valid & (1U << TPS546_FIELD_IOUT)) &&
+        snapshot->read_iout >= limits.iout_fault_a) {
+        return fail_regulator_safety(
+            state, snapshot, "TPS546 IOUT %.3fA >= maximum %.3fA", snapshot->read_iout,
+            limits.iout_fault_a);
+    }
+
+    if ((snapshot->valid & (1U << TPS546_FIELD_VOUT)) &&
+        snapshot->read_vout >= limits.asic_voltage_min_v &&
         fabsf(snapshot->read_vout - target_vout) <= TPS546_VOUT_TOLERANCE_VOLTS) {
         *settled = true;
     }
 
     return ESP_OK;
+}
+
+static bool is_tps_communication_error(esp_err_t err)
+{
+    return err == ESP_FAIL || err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_RESPONSE;
+}
+
+static void log_tps_driver_read_event(void *context, const char *reason)
+{
+    bitaxe_gamma602_log_read_retry((GlobalState *)context, reason);
+}
+
+static void log_tps_read_retry(GlobalState *state, const TPS546_StatusSnapshot *snapshot,
+                               const char *outcome, unsigned elapsed_ms)
+{
+    char message[M45_FAULT_MESSAGE_MAX + 1];
+    const int prefix = snprintf(message, sizeof(message), "TPS546 read %s after %ums; ",
+                                outcome, elapsed_ms);
+    TPS546_format_snapshot(snapshot, message + prefix, sizeof(message) - (size_t)prefix);
+    format_fault_context(state, message, message, sizeof(message));
+    ESP_LOGW(TAG, "%s", message);
+    (void)m45_fault_log_record(message);
+}
+
+static esp_err_t capture_power_snapshot(GlobalState *state,
+                                         TPS546_StatusSnapshot *snapshot, bool startup)
+{
+    const int64_t started_us = esp_timer_get_time();
+    const int64_t retry_window_us = 5000000;
+    bool retrying = false;
+
+    while (true) {
+        memset(snapshot, 0, sizeof(*snapshot));
+        const esp_err_t err = TPS546_snapshot_status(snapshot);
+        if (err == ESP_OK) {
+            remember_fault_power_sample(snapshot);
+        }
+        // A failed later register read must not hide unsafe values already
+        // sampled. Valid bits prevent unread fields being treated as zero.
+        bool settled = false;
+        const esp_err_t safety_err = startup
+            ? validate_regulator_startup_snapshot(state, snapshot, &settled, 0.0f)
+            : validate_regulator_safety(state, snapshot, 0.0f, false);
+        if (safety_err != ESP_OK) {
+            return safety_err;
+        }
+        const int64_t elapsed_us = esp_timer_get_time() - started_us;
+        if (err == ESP_OK) {
+            store_power_snapshot(snapshot);
+            if (retrying) {
+                log_tps_read_retry(state, snapshot, "recovered", (unsigned)(elapsed_us / 1000));
+            }
+            return ESP_OK;
+        }
+        if (!is_tps_communication_error(err)) {
+            return fail_regulator_safety(state, snapshot, "TPS546 %s read failed",
+                                         startup ? "validation" : "monitor");
+        }
+        if (!retrying) {
+            log_tps_read_retry(state, snapshot, "retrying", (unsigned)(elapsed_us / 1000));
+            retrying = true;
+        }
+        if (elapsed_us >= retry_window_us) {
+            return fail_regulator_safety(state, snapshot,
+                                         "TPS546 %s read failed for %ums",
+                                         startup ? "validation" : "monitor",
+                                         (unsigned)(elapsed_us / 1000));
+        }
+        // Retry reads only. Leave reset/output state unchanged, and do not
+        // start another transaction after the five-second observation window.
+        const int64_t remaining_ms = (retry_window_us - elapsed_us + 999) / 1000;
+        const unsigned delay_ms = remaining_ms < 100 ? (unsigned)remaining_ms : 100;
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        if (esp_timer_get_time() - started_us >= retry_window_us) {
+            return fail_regulator_safety(state, snapshot,
+                                         "TPS546 %s read failed for 5000ms",
+                                         startup ? "validation" : "monitor");
+        }
+    }
 }
 
 static esp_err_t wait_for_regulator_after_enable(GlobalState *state, float target_vout)
@@ -1652,9 +1840,8 @@ static esp_err_t wait_for_regulator_after_enable(GlobalState *state, float targe
 
     while (true) {
         TPS546_StatusSnapshot snapshot;
-        esp_err_t err = capture_power_snapshot(&snapshot);
+        esp_err_t err = capture_power_snapshot(state, &snapshot, true);
         if (err != ESP_OK) {
-            (void)fail_regulator_safety(state, &snapshot, "TPS546 validation read failed");
             return err;
         }
         update_power_state(state, &snapshot);
@@ -1694,20 +1881,20 @@ static void power_monitor_task(void *arg)
             continue;
         }
 
-        TPS546_StatusSnapshot snapshot;
-        esp_err_t err = capture_power_snapshot(&snapshot);
-        if (err != ESP_OK) {
-            if (!g_regulator_enabled) {
-                continue;
-            }
-            (void)fail_regulator_safety(state, &snapshot, "TPS546 monitor read failed");
+        // Startup and manual power changes own this lock. A snapshot must not
+        // straddle a power transition or start concurrent read retry windows.
+        if (take_asic_transition_lock(0) != ESP_OK) {
+            continue;
+        }
+        if (!g_regulator_enabled) {
+            give_asic_transition_lock();
             continue;
         }
 
-        // A manual power transition can begin while an I2C snapshot is in
-        // flight. Do not treat the intentional OPERATION_OFF response as a
-        // regulator fault after the transition has disabled the output.
-        if (!g_regulator_enabled) {
+        TPS546_StatusSnapshot snapshot;
+        esp_err_t err = capture_power_snapshot(state, &snapshot, false);
+        if (err != ESP_OK) {
+            give_asic_transition_lock();
             continue;
         }
 
@@ -1718,6 +1905,7 @@ static void power_monitor_task(void *arg)
                      : m45_config_effective_asic_voltage_mv(m45_config_get())) /
                     1000.0f,
                 false) != ESP_OK) {
+            give_asic_transition_lock();
             continue;
         }
 
@@ -1725,6 +1913,7 @@ static void power_monitor_task(void *arg)
         update_power_average(&snapshot, &averaged_snapshot);
         store_power_snapshot(&averaged_snapshot);
         update_power_state(state, &averaged_snapshot);
+        give_asic_transition_lock();
 
         if (state->ASIC_initalized) {
             bool domain_rebooted = false;
@@ -1802,6 +1991,7 @@ static esp_err_t start_power_monitor(GlobalState *state)
 void bitaxe_gamma602_init_state(GlobalState *state)
 {
     memset(state, 0, sizeof(*state));
+    TPS546_set_read_event_callback(log_tps_driver_read_event, state);
 
     state->DEVICE_CONFIG = (DeviceConfig) {
         .board_version = "602",
@@ -1872,20 +2062,22 @@ esp_err_t bitaxe_gamma602_start_fan(GlobalState *state)
     return bitaxe_fan_init(state);
 }
 
-static esp_err_t bitaxe_gamma602_start_hardware_unlocked(GlobalState *state)
+static esp_err_t initialize_hardware_unlocked(GlobalState *state)
 {
     if (state->ASIC_TASK_MODULE.active_jobs == NULL || state->valid_jobs == NULL) {
-        set_hw_status("job table missing");
-        return ESP_ERR_NO_MEM;
+        return shutdown_and_return(state, "ASIC job tables missing", ESP_ERR_NO_MEM);
     }
 
-    ESP_RETURN_ON_ERROR(bitaxe_gamma602_start_fan(state), TAG, "fan init failed");
+    esp_err_t ret = bitaxe_gamma602_start_fan(state);
+    if (ret != ESP_OK) {
+        return shutdown_and_return(state, "ASIC fan init failed", ret);
+    }
     clear_power_snapshot();
     reset_power_average_window();
 
     set_hw_status("regulator init");
     ESP_LOGI(TAG, "initializing TPS546 for Gamma 602");
-    esp_err_t ret = TPS546_init(gamma_tps546_config());
+    ret = TPS546_init(gamma_tps546_config());
     if (ret != ESP_OK) {
         return shutdown_and_return(state, "TPS546 init failed", ret);
     }
@@ -1909,6 +2101,12 @@ static esp_err_t bitaxe_gamma602_start_hardware_unlocked(GlobalState *state)
     ESP_LOGI(TAG, "setting BM1370 core voltage to %.3f V", volts);
     ret = TPS546_set_vout(volts);
     if (ret != ESP_OK) {
+        if (ret == ESP_ERR_INVALID_STATE) {
+            TPS546_StatusSnapshot snapshot;
+            (void)TPS546_snapshot_status(&snapshot);
+            return fail_regulator_safety(state, &snapshot,
+                                         "TPS546 output command did not latch ON");
+        }
         return shutdown_and_return(state, "TPS546 set voltage failed", ret);
     }
     g_commanded_voltage_mv = voltage_mv;
@@ -1933,6 +2131,9 @@ static esp_err_t bitaxe_gamma602_start_hardware_unlocked(GlobalState *state)
     if (ret != ESP_OK) {
         return shutdown_and_return(state, "ASIC serial init failed", ret);
     }
+    // Discard nonce/partial response bytes left over from the previous run
+    // before sending the chip-ID request at the startup baud.
+    SERIAL_clear_buffer();
 
     set_hw_status("asic detect");
     g_chip_count = BM1370_init(state);
@@ -1947,6 +2148,26 @@ static esp_err_t bitaxe_gamma602_start_hardware_unlocked(GlobalState *state)
         return shutdown_and_return(state, "ASIC baud change failed", ret);
     }
     SERIAL_clear_buffer();
+    // The power monitor skips transitions while this task holds the lock.
+    // Recheck the regulator after the handshake before exposing a ready ASIC.
+    ret = wait_for_regulator_after_enable(state, volts);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    // A known-valid hot ASIC must not be exposed as ready while its startup
+    // sensor grace is active. Missing/sentinel readings retain their existing
+    // startup handling in update_asic_temperature().
+    float ready_temp_c = 0.0f;
+    if (read_asic_temp_for_voltage(state, &ready_temp_c) &&
+        isfinite(ready_temp_c) && !asic_temp_is_no_reading(ready_temp_c) &&
+        ready_temp_c >= (float)config->safety_asic_temp_max_c) {
+        safety_shutdownf(state, "ASIC temperature %.1fC >= maximum %.1fC during startup",
+                         ready_temp_c, (float)config->safety_asic_temp_max_c);
+        return ESP_FAIL;
+    }
+    if (state->SYSTEM_MODULE.hardware_fault || !g_regulator_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
     state->ASIC_initalized = true;
     g_asic_temp_grace_until =
         xTaskGetTickCount() + pdMS_TO_TICKS(ASIC_TEMP_STARTUP_GRACE_MS);
@@ -1958,6 +2179,39 @@ static esp_err_t bitaxe_gamma602_start_hardware_unlocked(GlobalState *state)
              g_chip_count, state->POWER_MANAGEMENT_MODULE.actual_frequency,
              g_commanded_voltage_mv);
     return ESP_OK;
+}
+
+static esp_err_t bitaxe_gamma602_start_hardware_unlocked(GlobalState *state)
+{
+    if (state->SYSTEM_MODULE.hardware_fault) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const bool was_paused = stratum_minimal_work_paused();
+    stratum_minimal_pause_work();
+    state->ASIC_initalized = false;
+
+    // Startup is requested explicitly by boot/manual power-on. Hold reset
+    // before draining the old mining receive so it cannot steal chip-ID data.
+    esp_err_t err = asic_reset_level(0);
+    if (err != ESP_OK) {
+        err = shutdown_and_return(state, "ASIC reset hold failed", err);
+    } else if (!stratum_minimal_wait_for_asic_rx_idle(ASIC_RX_DRAIN_TIMEOUT_MS)) {
+        err = shutdown_and_return(state, "ASIC UART receive did not become idle before startup",
+                                  ESP_ERR_TIMEOUT);
+    } else {
+        // Exactly one initialization. Communication grace retries reads in the
+        // drivers; it never repeats a reset, regulator enable, or ASIC startup.
+        err = initialize_hardware_unlocked(state);
+    }
+    if (err == ESP_OK) {
+        state->SYSTEM_MODULE.hardware_fault_msg[0] = '\0';
+    } else if (!state->SYSTEM_MODULE.hardware_fault) {
+        set_hw_status("asic off");
+    }
+    if (!was_paused) {
+        stratum_minimal_resume_work();
+    }
+    return err;
 }
 
 esp_err_t bitaxe_gamma602_start_hardware(GlobalState *state)
@@ -1994,12 +2248,6 @@ esp_err_t bitaxe_gamma602_set_asic_power(GlobalState *state, bool enabled, bool 
         if (state->ASIC_initalized && g_regulator_enabled) {
             goto out;
         }
-        err = asic_reset_level(0);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "failed to hold ASIC reset before power-on: %s",
-                     esp_err_to_name(err));
-            goto out;
-        }
         const m45_config_t *config = m45_config_get();
         state->POWER_MANAGEMENT_MODULE.frequency_value =
             (float)m45_config_effective_asic_frequency_mhz(config);
@@ -2015,7 +2263,8 @@ esp_err_t bitaxe_gamma602_set_asic_power(GlobalState *state, bool enabled, bool 
         if (manage_fan) {
             err = bitaxe_fan_start_for_asic(state);
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "ASIC fan start failed: %s", esp_err_to_name(err));
+                err = shutdown_and_return(state, "ASIC fan start failed", err);
+                set_hw_status("asic off");
                 goto out;
             }
         }
@@ -2032,6 +2281,7 @@ esp_err_t bitaxe_gamma602_set_asic_power(GlobalState *state, bool enabled, bool 
     }
 
     ESP_LOGI(TAG, "manual ASIC power off requested");
+    remember_fault_operating_settings(state);
     set_hw_status("asic off");
     reset_domain_reboot_recovery();
     g_regulator_enabled = false;
@@ -2136,9 +2386,18 @@ static esp_err_t bitaxe_gamma602_set_voltage_mv_for_config_unlocked(
 
     set_hw_status("voltage update");
     esp_err_t ret = TPS546_set_vout(volts);
-    if (ret == ESP_OK) {
-        ret = wait_for_regulator_after_enable(state, volts);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        TPS546_StatusSnapshot snapshot;
+        (void)TPS546_snapshot_status(&snapshot);
+        return fail_regulator_safety(state, &snapshot,
+                                     "TPS546 output command did not latch ON");
     }
+    if (ret != ESP_OK) {
+        (void)shutdown_and_return(state, "TPS546 voltage update failed", ret);
+        set_hw_status("asic off");
+        return ret;
+    }
+    ret = wait_for_regulator_after_enable(state, volts);
     if (ret == ESP_OK) {
         g_commanded_voltage_mv = voltage_mv;
         set_hw_status("ready");

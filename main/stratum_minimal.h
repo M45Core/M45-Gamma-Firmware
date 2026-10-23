@@ -119,6 +119,7 @@ void stratum_minimal_reconnect(void);
 void stratum_minimal_reconnect_pools(uint32_t pool_mask);
 void stratum_minimal_pause_work(void);
 void stratum_minimal_resume_work(void);
+bool stratum_minimal_wait_for_asic_rx_idle(uint32_t timeout_ms);
 void stratum_minimal_reset_hashrate(void);
 bool stratum_minimal_work_paused(void);
 bool stratum_minimal_started(void);

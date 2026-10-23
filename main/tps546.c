@@ -2,10 +2,12 @@
 
 #include <math.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "i2c_bitaxe.h"
@@ -83,8 +85,8 @@
 #define TPS546_VOUT_UV_WARN_LIMIT_RATIO  0.90f
 #define TPS546_VOUT_UV_FAULT_LIMIT_RATIO 0.75f
 #define TPS546_READY_DELAY_MS             15
-#define TPS546_ID_RETRIES                 6
-#define TPS546_ID_RETRY_DELAY_MS          3
+#define TPS546_READ_RETRY_WINDOW_US       5000000
+#define TPS546_READ_RETRY_DELAY_MS        100
 
 static const char *TAG = "tps546";
 static const uint8_t DEVICE_ID_TPS546D24A[] = {0x54, 0x49, 0x54, 0x6D, 0x24, 0x41};
@@ -95,6 +97,31 @@ static TPS546_CONFIG s_config;
 static int s_vout_exponent;
 static bool s_vout_mode_valid;
 static const char *s_tps546_model = "";
+static void (*s_read_event_callback)(void *, const char *);
+static void *s_read_event_context;
+
+void TPS546_set_read_event_callback(void (*callback)(void *, const char *), void *context)
+{
+    s_read_event_callback = callback;
+    s_read_event_context = context;
+}
+
+static void report_read_event(uint8_t command, const char *outcome, int64_t elapsed_us,
+                               esp_err_t error)
+{
+    char message[192];
+    snprintf(message, sizeof(message), "TPS546 PMBus read 0x%02x %s after %ums",
+             command, outcome, (unsigned)(elapsed_us / 1000));
+    if (error != ESP_OK) {
+        const size_t used = strlen(message);
+        snprintf(message + used, sizeof(message) - used, "; %s (0x%x)",
+                 esp_err_to_name(error), (unsigned)error);
+    }
+    ESP_LOGW(TAG, "%s", message);
+    if (s_read_event_callback != NULL) {
+        s_read_event_callback(s_read_event_context, message);
+    }
+}
 
 static int32_t sign_extend(uint32_t value, unsigned bits)
 {
@@ -155,6 +182,42 @@ static esp_err_t tps_read_byte(uint8_t command, uint8_t *data)
     return i2c_bitaxe_register_read(s_tps546_i2c_handle, command, data, 1);
 }
 
+static bool retryable_read_error(esp_err_t err)
+{
+    return err == ESP_FAIL || err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_RESPONSE;
+}
+
+// Used for startup/readback reads only. Snapshot sampling owns one shared
+// deadline in bitaxe_hw, so its per-register reads must not nest this window.
+static esp_err_t tps_read_byte_with_retry(uint8_t command, uint8_t *data)
+{
+    const int64_t started_us = esp_timer_get_time();
+    bool retrying = false;
+    while (true) {
+        const esp_err_t err = tps_read_byte(command, data);
+        const int64_t elapsed_us = esp_timer_get_time() - started_us;
+        if (err == ESP_OK) {
+            if (retrying) {
+                report_read_event(command, "recovered", elapsed_us, ESP_OK);
+            }
+            return ESP_OK;
+        }
+        if (!retryable_read_error(err) || elapsed_us >= TPS546_READ_RETRY_WINDOW_US) {
+            return err;
+        }
+        if (!retrying) {
+            report_read_event(command, "retrying reads up to 5000ms", elapsed_us, err);
+            retrying = true;
+        }
+        const int64_t remaining_ms = (TPS546_READ_RETRY_WINDOW_US - elapsed_us + 999) / 1000;
+        vTaskDelay(pdMS_TO_TICKS(remaining_ms < TPS546_READ_RETRY_DELAY_MS
+                                   ? (unsigned)remaining_ms : TPS546_READ_RETRY_DELAY_MS));
+        if (esp_timer_get_time() - started_us >= TPS546_READ_RETRY_WINDOW_US) {
+            return err;
+        }
+    }
+}
+
 static esp_err_t tps_write_byte(uint8_t command, uint8_t data)
 {
     return i2c_bitaxe_register_write_byte(s_tps546_i2c_handle, command, data);
@@ -212,7 +275,7 @@ static esp_err_t tps_write_ulinear16(uint8_t command, float value, const char *n
 static esp_err_t read_vout_mode(void)
 {
     uint8_t mode = 0;
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_VOUT_MODE, &mode), TAG, "read VOUT_MODE failed");
+    ESP_RETURN_ON_ERROR(tps_read_byte_with_retry(PMBUS_VOUT_MODE, &mode), TAG, "read VOUT_MODE failed");
 
     s_vout_exponent = (int)sign_extend(mode & 0x1F, 5);
     s_vout_mode_valid = true;
@@ -233,16 +296,38 @@ static const char *model_from_device_id(const uint8_t id[6])
 
 static esp_err_t read_device_id(uint8_t id[6])
 {
+    const int64_t started_us = esp_timer_get_time();
     esp_err_t last_err = ESP_FAIL;
-
-    for (int attempt = 0; attempt < TPS546_ID_RETRIES; ++attempt) {
+    bool retrying = false;
+    while (true) {
         last_err = tps_read_block(PMBUS_IC_DEVICE_ID, id, 6);
         const char *model = last_err == ESP_OK ? model_from_device_id(id) : NULL;
         if (model != NULL) {
             s_tps546_model = model;
+            if (retrying) {
+                report_read_event(PMBUS_IC_DEVICE_ID, "recovered", esp_timer_get_time() - started_us,
+                                   ESP_OK);
+            }
             return ESP_OK;
         }
-        vTaskDelay(pdMS_TO_TICKS(TPS546_ID_RETRY_DELAY_MS));
+        const int64_t elapsed_us = esp_timer_get_time() - started_us;
+        if ((last_err != ESP_OK && !retryable_read_error(last_err)) ||
+            elapsed_us >= TPS546_READ_RETRY_WINDOW_US) {
+            break;
+        }
+        if (!retrying) {
+            report_read_event(PMBUS_IC_DEVICE_ID,
+                               last_err == ESP_OK ? "invalid device-ID; retrying reads up to 5000ms"
+                                                  : "retrying reads up to 5000ms",
+                               elapsed_us, last_err);
+            retrying = true;
+        }
+        const int64_t remaining_ms = (TPS546_READ_RETRY_WINDOW_US - elapsed_us + 999) / 1000;
+        vTaskDelay(pdMS_TO_TICKS(remaining_ms < TPS546_READ_RETRY_DELAY_MS
+                                   ? (unsigned)remaining_ms : TPS546_READ_RETRY_DELAY_MS));
+        if (esp_timer_get_time() - started_us >= TPS546_READ_RETRY_WINDOW_US) {
+            break;
+        }
     }
 
     ESP_LOGE(TAG, "unexpected TPS546 device ID %02x %02x %02x %02x %02x %02x", id[0], id[1],
@@ -474,9 +559,11 @@ esp_err_t TPS546_set_vout(float volts)
                         "turn output on failed");
 
     uint8_t operation = 0;
-    ESP_RETURN_ON_ERROR(tps_read_byte(PMBUS_OPERATION, &operation), TAG,
+    ESP_RETURN_ON_ERROR(tps_read_byte_with_retry(PMBUS_OPERATION, &operation), TAG,
                         "read OPERATION failed");
-    ESP_RETURN_ON_FALSE((operation & OPERATION_ON) != 0, ESP_FAIL, TAG,
+    // A successful read proving the command did not latch is a real regulator
+    // state failure, not a transport error eligible for automatic recovery.
+    ESP_RETURN_ON_FALSE((operation & OPERATION_ON) != 0, ESP_ERR_INVALID_STATE, TAG,
                         "OPERATION did not latch ON: 0x%02x", operation);
 
     ESP_LOGI(TAG, "output on %.3f V", volts);

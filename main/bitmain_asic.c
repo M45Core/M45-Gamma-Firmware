@@ -7,9 +7,13 @@
 #include "asic_serial.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define BITMAIN_RESPONSE_PREAMBLE 0xaa55u
 #define BITMAIN_CHIP_ID_TIMEOUT_MS 1000
+#define BITMAIN_CHIP_ID_RETRY_WINDOW_MS 5000
+#define BITMAIN_CHIP_ID_RETRY_DELAY_MS 100
 #define BITMAIN_WORK_TIMEOUT_MS 10000
 #define BITMAIN_MAX_CHIP_ID_RESPONSE_BYTES 16
 
@@ -55,7 +59,9 @@ static bool validate_preamble(const uint8_t *buffer)
     return received_preamble == BITMAIN_RESPONSE_PREAMBLE;
 }
 
-int count_asic_chips(uint16_t asic_count, uint16_t chip_id, int chip_id_response_length)
+int count_asic_chips(uint16_t asic_count, uint16_t chip_id, int chip_id_response_length,
+                      void (*request_read)(void *),
+                      void (*read_event)(void *, bool), void *context)
 {
     if (chip_id_response_length <= 0 ||
         chip_id_response_length > BITMAIN_MAX_CHIP_ID_RESPONSE_BYTES) {
@@ -65,59 +71,65 @@ int count_asic_chips(uint16_t asic_count, uint16_t chip_id, int chip_id_response
 
     uint8_t buffer[BITMAIN_MAX_CHIP_ID_RESPONSE_BYTES] = {0};
     int chip_counter = 0;
+    bool retrying = false;
+    const int64_t started_us = esp_timer_get_time();
+    const int64_t timeout_us = (int64_t)BITMAIN_CHIP_ID_RETRY_WINDOW_MS * 1000;
     while (true) {
-        const int received =
-            SERIAL_rx(buffer, (uint16_t)chip_id_response_length, BITMAIN_CHIP_ID_TIMEOUT_MS);
-        if (received == 0) {
+        const int64_t elapsed_us = esp_timer_get_time() - started_us;
+        if (elapsed_us >= timeout_us) {
             break;
         }
-
-        if (received < 0) {
-            ESP_LOGE(TAG, "error reading CHIP_ID");
-            break;
+        // Only repeat the chip-ID read command. Reset, power, baud and the
+        // remaining initialization sequence are unchanged during this window.
+        if (chip_counter == 0 && request_read != NULL) {
+            request_read(context);
         }
-
-        if (received != chip_id_response_length) {
-            ESP_LOGE(TAG, "invalid CHIP_ID response length: expected %d, got %d",
-                     chip_id_response_length, received);
-            ESP_LOG_BUFFER_HEX(TAG, buffer, received);
-            break;
+        const int64_t remaining_ms = (timeout_us - elapsed_us + 999) / 1000;
+        const uint16_t read_ms = remaining_ms < BITMAIN_CHIP_ID_TIMEOUT_MS
+                                     ? (uint16_t)remaining_ms : BITMAIN_CHIP_ID_TIMEOUT_MS;
+        const int received = SERIAL_rx(buffer, (uint16_t)chip_id_response_length, read_ms);
+        bool valid = received == chip_id_response_length;
+        if (valid) {
+            const uint16_t received_chip_id = ((uint16_t)buffer[2] << 8) | buffer[3];
+            valid = validate_preamble(buffer) && received_chip_id == chip_id &&
+                    crc5(buffer + 2, (size_t)received - 2U) == 0;
         }
-
-        if (!validate_preamble(buffer)) {
-            const uint16_t received_preamble = ((uint16_t)buffer[0] << 8) | buffer[1];
-            ESP_LOGW(TAG, "CHIP_ID preamble mismatch: expected 0x%04x, got 0x%04x",
-                     BITMAIN_RESPONSE_PREAMBLE, received_preamble);
-            ESP_LOG_BUFFER_HEX(TAG, buffer, received);
+        if (valid) {
+            ESP_LOGI(TAG, "chip %d detected: CORE_NUM=0x%02x ADDR=0x%02x", chip_counter,
+                     buffer[4], buffer[5]);
+            ++chip_counter;
+            if (asic_count > 0 && chip_counter >= asic_count) {
+                break;
+            }
             continue;
         }
-
-        const uint16_t received_chip_id = ((uint16_t)buffer[2] << 8) | buffer[3];
-        if (received_chip_id != chip_id) {
-            ESP_LOGW(TAG, "CHIP_ID mismatch: expected 0x%04x, got 0x%04x", chip_id,
-                     received_chip_id);
-            ESP_LOG_BUFFER_HEX(TAG, buffer, received);
-            continue;
+        if (!retrying) {
+            ESP_LOGW(TAG, "CHIP_ID read failed or invalid (%d bytes); retrying reads up to %ums",
+                     received, BITMAIN_CHIP_ID_RETRY_WINDOW_MS);
+            if (read_event != NULL) {
+                read_event(context, false);
+            }
+            retrying = true;
         }
-
-        if (crc5(buffer + 2, (size_t)received - 2U) != 0) {
-            ESP_LOGW(TAG, "CHIP_ID checksum failed");
-            ESP_LOG_BUFFER_HEX(TAG, buffer, received);
-            continue;
-        }
-
-        ESP_LOGI(TAG, "chip %d detected: CORE_NUM=0x%02x ADDR=0x%02x", chip_counter,
-                 buffer[4], buffer[5]);
-        ++chip_counter;
-        if (asic_count > 0 && chip_counter >= asic_count) {
+        // Do not re-query a partially discovered chain and count its first
+        // chip twice. Gamma602 has one chip, so its failures retry below.
+        if (chip_counter > 0) {
             break;
         }
+        const int64_t delay_remaining_us = timeout_us - (esp_timer_get_time() - started_us);
+        if (delay_remaining_us <= 0) {
+            break;
+        }
+        const int64_t delay_ms = (delay_remaining_us + 999) / 1000;
+        vTaskDelay(pdMS_TO_TICKS(delay_ms < BITMAIN_CHIP_ID_RETRY_DELAY_MS
+                                   ? (unsigned)delay_ms : BITMAIN_CHIP_ID_RETRY_DELAY_MS));
     }
 
     if (chip_counter != asic_count) {
         ESP_LOGW(TAG, "%d chip(s) detected on chain, expected %u", chip_counter, asic_count);
+    } else if (retrying && read_event != NULL) {
+        read_event(context, true);
     }
-
     return chip_counter;
 }
 

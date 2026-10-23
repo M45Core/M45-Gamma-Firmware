@@ -123,6 +123,7 @@ typedef struct {
 static QueueHandle_t g_work_queue;
 static SemaphoreHandle_t g_transport_lock;
 static SemaphoreHandle_t g_work_reset_lock;
+static SemaphoreHandle_t g_asic_result_lock;
 static esp_transport_handle_t g_transport;
 static portMUX_TYPE g_uid_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_share_id_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -1476,10 +1477,17 @@ static void asic_hashrate_monitor_task(void *arg)
         if (g_state != NULL && g_state->ASIC_initalized &&
             !g_state->SYSTEM_MODULE.hardware_fault && !atomic_load(&g_work_paused)) {
             wait_for_recent_job_send();
-            const uint64_t read_started_us = (uint64_t)esp_timer_get_time();
-            BM1370_read_registers();
-            vTaskDelay(pdMS_TO_TICKS(ASIC_HASHRATE_SETTLE_MS));
-            record_domain_hashrate_sample(read_started_us);
+            uint64_t read_started_us = 0;
+            xSemaphoreTake(g_work_reset_lock, portMAX_DELAY);
+            if (g_state->ASIC_initalized && !atomic_load(&g_work_paused)) {
+                read_started_us = (uint64_t)esp_timer_get_time();
+                BM1370_read_registers();
+            }
+            xSemaphoreGive(g_work_reset_lock);
+            if (read_started_us != 0) {
+                vTaskDelay(pdMS_TO_TICKS(ASIC_HASHRATE_SETTLE_MS));
+                record_domain_hashrate_sample(read_started_us);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(ASIC_HASHRATE_POLL_MS));
     }
@@ -1883,7 +1891,8 @@ static void set_session_disconnected(uint8_t pool_id, bool clear_work)
 
 static bool stratum_runtime_ready(void)
 {
-    return g_work_queue != NULL && g_transport_lock != NULL && g_work_reset_lock != NULL;
+    return g_work_queue != NULL && g_transport_lock != NULL && g_work_reset_lock != NULL &&
+           g_asic_result_lock != NULL;
 }
 
 static void free_queued_work(queued_work_t *work)
@@ -2201,6 +2210,20 @@ void stratum_minimal_resume_work(void)
         xSemaphoreGive(g_work_reset_lock);
     }
     atomic_store(&g_work_paused, false);
+}
+
+bool stratum_minimal_wait_for_asic_rx_idle(uint32_t timeout_ms)
+{
+    // The caller has paused work or marked the ASIC uninitialized, preventing
+    // new receives. Drain the old read before startup can send chip-ID queries.
+    // This wait is used only for a power transition, not ordinary clock tuning.
+    if (g_asic_result_lock != NULL) {
+        if (xSemaphoreTake(g_asic_result_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+            return false;
+        }
+        xSemaphoreGive(g_asic_result_lock);
+    }
+    return true;
 }
 
 bool stratum_minimal_work_paused(void)
@@ -4818,6 +4841,22 @@ static int submit_share_pool_transport(uint8_t pool_id, int request_id, const bm
     return ret;
 }
 
+static task_result *read_asic_result(void)
+{
+    task_result *result = NULL;
+    xSemaphoreTake(g_asic_result_lock, portMAX_DELAY);
+    // Recheck after taking the lock so a receive cannot begin after the
+    // transition task has paused work and drained the previous receive.
+    if (g_state->ASIC_initalized && !atomic_load(&g_work_paused)) {
+        result = BM1370_process_work(g_state);
+        if (!g_state->ASIC_initalized || atomic_load(&g_work_paused)) {
+            result = NULL;
+        }
+    }
+    xSemaphoreGive(g_asic_result_lock);
+    return result;
+}
+
 static void result_task(void *arg)
 {
     (void)arg;
@@ -4831,7 +4870,7 @@ static void result_task(void *arg)
 #ifdef M45_ASIC_LOSS_METRICS
         const uint64_t rx_started_us = (uint64_t)esp_timer_get_time();
 #endif
-        task_result *result = BM1370_process_work(g_state);
+        task_result *result = read_asic_result();
 #ifdef M45_ASIC_LOSS_METRICS
         const uint64_t rx_duration_us = (uint64_t)esp_timer_get_time() - rx_started_us;
 #endif
@@ -5021,7 +5060,9 @@ esp_err_t stratum_minimal_start(GlobalState *state)
     g_work_queue = xQueueCreate(WORK_QUEUE_DEPTH, sizeof(queued_work_t));
     g_transport_lock = xSemaphoreCreateMutex();
     g_work_reset_lock = xSemaphoreCreateMutex();
-    if (g_work_queue == NULL || g_transport_lock == NULL || g_work_reset_lock == NULL) {
+    g_asic_result_lock = xSemaphoreCreateMutex();
+    if (g_work_queue == NULL || g_transport_lock == NULL || g_work_reset_lock == NULL ||
+        g_asic_result_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
     esp_err_t monitor_err = init_asic_hashrate_monitor(g_state->DEVICE_CONFIG.family.asic_count);

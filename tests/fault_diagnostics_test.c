@@ -1,4 +1,6 @@
 #include <assert.h>
+#include <float.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +11,7 @@
 #include "nvs.h"
 #include "m45_error_log.h"
 #include "m45_fault_log.h"
+#include "m45_fault_context.h"
 #include "m45_log_buffer.h"
 #include "tps546.h"
 
@@ -73,6 +76,78 @@ static void snapshot_tests(void)
     assert(strstr(text,"command=1.160V")); // Even simultaneous flags retain measurements.
     char tiny[4]={'x','x','x','x'};TPS546_format_snapshot(&s,tiny,sizeof(tiny));assert(tiny[3]==0);
     TPS546_format_snapshot(NULL,text,sizeof(text));assert(strstr(text,"unavailable"));
+}
+
+static void operating_context_tests(void)
+{
+    char text[M45_FAULT_MESSAGE_MAX + 1];
+    m45_fault_context_t context = {
+        .requested_frequency_mhz = 600,
+        .requested_voltage_mv = 1175,
+    };
+    m45_fault_context_format(&context, 10000, "ASIC detection failed", text, sizeof(text));
+    assert(strstr(text, "ASIC detection failed; operating context:"));
+    assert(strstr(text, "actual=unavailable requested=600MHz"));
+    assert(strstr(text, "requested=1175mV commanded=unavailable"));
+    assert(strstr(text, "VIN=unavailable VOUT=unavailable IOUT=unavailable VR=unavailable"));
+    assert(strstr(text, "last ASIC temp=unavailable"));
+    assert(!strstr(text, "age=") && !strstr(text, "=0V"));
+
+    m45_fault_context_remember_settings(&context, 10000, 599.5f, 600, 1175, 1180);
+    m45_fault_context_remember_power(&context, 10000, 5.1f, 1.18f, 17.0f, 57.0f);
+    m45_fault_context_remember_asic_temp(&context, 10250, 61.25f);
+    m45_fault_context_format(&context, 11000, "TPS546 timeout", text, sizeof(text));
+    assert(strstr(text, "actual=599.5MHz requested=600MHz"));
+    assert(strstr(text, "last operating age=1000ms clock"));
+    assert(strstr(text, "commanded=1180mV"));
+    assert(strstr(text, "last TPS age=1000ms VIN=5.1V VOUT=1.18V IOUT=17A VR=57C"));
+    assert(strstr(text, "last ASIC age=750ms temp=61.25C"));
+
+    // An unread/non-finite sample must not replace the last measurement or its age.
+    m45_fault_context_remember_power(&context, 12000, NAN, 0, 0, 0);
+    m45_fault_context_remember_asic_temp(&context, 12000, INFINITY);
+    // Reinitialization clears live frequency/voltage; retain the prior run.
+    m45_fault_context_remember_settings(&context, 12000, 0, 525, 1150, 0);
+    m45_fault_context_format(&context, 13000, "TPS546 timeout again", text, sizeof(text));
+    assert(strstr(text, "last TPS age=3000ms VIN=5.1V"));
+    assert(strstr(text, "last ASIC age=2750ms temp=61.25C"));
+    assert(strstr(text, "last operating age=3000ms clock actual=599.5MHz requested=600MHz"));
+    assert(strstr(text, "core requested=1175mV commanded=1180mV"));
+    // A measured zero is distinct from an unavailable value.
+    m45_fault_context_remember_power(&context, 13000, 5, 0, 0, 25);
+    m45_fault_context_format(&context, 13000, "output off", text, sizeof(text));
+    assert(strstr(text, "VOUT=0V IOUT=0A"));
+
+    // Preserve context even with a full simultaneous-fault TPS diagnostic.
+    TPS546_StatusSnapshot snapshot = {.valid=TPS546_SNAPSHOT_ALL_VALID,
+        .status_word=0xffff, .st_vout=0xff, .st_input=0xff, .st_iout=0xff,
+        .st_temp=0xff, .st_cml=0xff, .st_mfr=0xff, .st_other=0xff,
+        .read_vin=5.1f, .read_vout=1.18f, .read_iout=33.4f,
+        .read_temp1=110, .vout_command=1.18f};
+    TPS546_format_snapshot(&snapshot, text, sizeof(text));
+    m45_fault_context_format(&context, 13000, text, text, sizeof(text));
+    assert(strstr(text, "output OFF; power-good lost"));
+    assert(strstr(text, "command=1.180V"));
+    assert(strstr(text, "last ASIC age=2750ms temp=61.25C"));
+    assert(strlen(text) <= M45_FAULT_MESSAGE_MAX);
+
+    // Capacity bound covers extreme values, maximum age, and in-place formatting.
+    m45_fault_context_remember_settings(&context, 0, FLT_MAX, FLT_MAX, UINT16_MAX, UINT16_MAX);
+    m45_fault_context_remember_power(&context, 0, -FLT_MAX, FLT_MAX, -FLT_MAX, FLT_MAX);
+    m45_fault_context_remember_asic_temp(&context, 0, -FLT_MAX);
+    memset(text, 'x', sizeof(text) - 1);
+    text[sizeof(text) - 1] = 0;
+    m45_fault_context_format(&context, UINT64_MAX, text, text, sizeof(text));
+    assert(strstr(text, "[reason truncated]"));
+    assert(strstr(text, "last operating age=18446744073709551615ms clock"));
+    assert(strstr(text, "last ASIC age=18446744073709551615ms temp=-3.40282e+38C"));
+    assert(strlen(text) == M45_FAULT_MESSAGE_MAX);
+    char tiny[4] = "bad";
+    m45_fault_context_format(&context, 0, "long reason", tiny, sizeof(tiny));
+    assert(!strcmp(tiny, "lon"));
+    m45_fault_context_format(NULL, 0, NULL, tiny, 1);
+    assert(tiny[0] == 0);
+    m45_fault_context_format(NULL, 0, NULL, NULL, 0);
 }
 
 static void persistence_tests(void)
@@ -142,4 +217,4 @@ static void error_capture_tests(void)
     assert(strstr(entries[0].message,"entry 69"));assert(strstr(entries[63].message,"entry 6"));
     free(entries);
 }
-int main(void){snapshot_tests();persistence_tests();error_capture_tests();puts("Fault diagnostics, persistence/migration, timestamps, and always-on error capture passed.");}
+int main(void){snapshot_tests();operating_context_tests();persistence_tests();error_capture_tests();puts("Fault diagnostics, operating context, persistence/migration, timestamps, and always-on error capture passed.");}

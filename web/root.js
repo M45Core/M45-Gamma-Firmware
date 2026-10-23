@@ -93,9 +93,9 @@ $('ota-leave-confirm').onclick=()=>{const action=otaLeaveAction;otaLeaveAction=n
 $('ota-leave-modal').onclick=e=>{if(e.target===$('ota-leave-modal'))$('ota-leave-cancel').click()};
 window.addEventListener('beforeunload',e=>{if((!otaUploadInFlight&&!axeosUploadInFlight)||otaAllowNavigation)return;
 e.preventDefault();e.returnValue=''});
-let dismissedFault=sessionStorage.getItem('dismissedFault')||'';
+let dismissedFault='';
 $('fault-close').onclick=()=>{dismissedFault=$('fault-panel').dataset.reason||'';
-sessionStorage.setItem('dismissedFault',dismissedFault);$('fault-panel').classList.add('hidden')};
+$('fault-panel').classList.add('hidden')};
 $('risk-cancel').onclick=()=>{$('risk-modal').classList.add('hidden');pendingRiskStatus=null};
 $('risk-modal').onclick=e=>{if(e.target===$('risk-modal'))$('risk-cancel').click()};
 $('oc-enable-cancel').onclick=()=>{$('oc-enable-modal').classList.add('hidden');$('cfg-overclock-enabled').checked=false;syncOverclockEnabled()};
@@ -208,6 +208,7 @@ async function addSwarmDevice(){const input=$('swarm-address'),address=input.val
 $('swarm-add-btn').disabled=true;try{await swarmPost('add',address);input.value='';txt('swarm-state',`Checking ${address}...`);setTimeout(refreshSwarm,1100)}
 catch(e){txt('swarm-state',`Add failed: ${e.message||e}`)}finally{$('swarm-add-btn').disabled=false}}
 async function swarmDeviceAction(device,action){if(action==='restart'&&!confirm(`Restart ${device.hostname||device.ip}?`))return;
+if(device.local&&action==='asic-on')dismissedFault='';
 try{if(device.local){const asicPower=action==='asic-on'||action==='asic-off',r=await fetch(asicPower?'/api/asic-power':`/api/system/${action}`,asicPower?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:action==='asic-on',manage_fan:true})}:{method:'POST',headers:{'X-Page-Token':PAGE_TOKEN}});const j=await r.json().catch(()=>({error:r.status}));if(r.status===409&&j.page_token){reloadFresh(j.page_token);return}if(!r.ok)throw new Error(j.error||r.status)}
 else await swarmPost('action',device.ip,action);txt('swarm-state',`${action==='restart'?'Restarted':action==='asic-off'?'ASIC off':'ASIC on'} ${device.hostname||device.ip}.`);
 if(!device.local)setTimeout(async()=>{try{await swarmPost('scan')}catch(_){}},800);else if(action!=='restart')setTimeout(refreshSwarm,500)}catch(e){txt('swarm-state',`${action} failed: ${e.message||e}`)}}
@@ -482,11 +483,17 @@ function setVoltageLimit(s){const active=s.auto_clock_enabled===true&&s.auto_clo
 $('voltage-limit-panel').classList.toggle('hidden',!active);
 txt('voltage-limit-detail',active?s.auto_clock_hold_reason||'Waiting for TPS input voltage to recover.':'')}
 function setFault(s){const p=$('fault-panel'),list=$('fault-reasons'),reasons=[];
-if(s.unsupported_board){p.classList.add('hidden');return}
-if(s.hardware_fault)reasons.push(s.hardware_fault_msg||'hardware fault');
-if(s.power_fault&&!reasons.length)reasons.push('power fault');
-const key=reasons.join('|');p.dataset.reason=key;if(!key||key===dismissedFault){p.classList.add('hidden');return}
-list.innerHTML=reasons.map(r=>`<li>${r}</li>`).join('');p.classList.remove('hidden')}
+const startupFailed=!s.booting&&s.asic_power_enabled===false&&!!s.hardware_fault_msg;
+if(!s.unsupported_board){
+if(s.hardware_fault||startupFailed)reasons.push(s.hardware_fault_msg||'hardware fault');
+if(s.power_fault&&!reasons.length)reasons.push('power fault')}
+const title=s.hardware_fault||s.power_fault?'Safety Shutdown':'ASIC Stopped';
+const key=reasons.length?`${title}|${reasons.join('|')}`:'';p.dataset.reason=key;
+if(!key){dismissedFault='';p.classList.add('hidden');return}
+if(key===dismissedFault){p.classList.add('hidden');return}
+txt('fault-title',title);list.replaceChildren();
+for(const reason of reasons){const item=document.createElement('li');item.textContent=reason;list.appendChild(item)}
+p.classList.remove('hidden')}
 function setUnsupportedBoard(s){const panel=$('unsupported-board-panel'),unsupported=!!s.unsupported_board;
 panel.classList.toggle('hidden',!unsupported);if(!unsupported)return;
 txt('unsupported-board-version',s.imported_board_version||'unknown');const button=$('axeos-return');
@@ -545,7 +552,7 @@ txt('hashrate-note','');$('hashrate-note').classList.add('hidden');
 if(s.booting){$('hashrate-state').className='pill warn';$('hashrate-state').textContent='BOOT'}
 }
 function setIssue(s){const label=$('issue-label'),value=$('issue');let issue='',name='Issue';
-if(s.hardware_fault)issue=s.hardware_fault_msg||'hardware fault';
+if(s.hardware_fault||(!s.booting&&s.asic_power_enabled===false&&s.hardware_fault_msg))issue=s.hardware_fault_msg||'hardware fault';
 else if(s.booting){name='Boot';issue=`Starting: ${s.hardware||'boot'}`}
 else if(s.setup_mode&&!s.wifi_connected){name='Setup';issue=`AP ${s.setup_ssid||'--'} at ${s.setup_ip||'--'}`}
 else if(s.wifi_connected&&s.asic_power_enabled!==false&&s.tps546_valid===false)issue='regulator not reporting';
@@ -880,7 +887,8 @@ setVal('cfg-fan-percent',t.fan_override_percent>=35?t.fan_override_percent:100);
 setVal('cfg-fan-target',t.fan_target_temp_c||62);syncFanSetting();syncOverclockEnabled();syncPreset()}
 async function runtimeTune(t){const r=await fetch('/api/runtime-tune',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(t)});
 const j=await r.json().catch(()=>({error:r.status}));if(!r.ok)throw new Error(j.error||r.status);return j}
-async function applyAsicPower(enabled,manageFan){const r=await fetch('/api/asic-power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,manage_fan:manageFan})});
+async function applyAsicPower(enabled,manageFan){if(enabled)dismissedFault='';
+const r=await fetch('/api/asic-power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,manage_fan:manageFan})});
 const j=await r.json().catch(()=>({error:r.status}));if(!r.ok)throw new Error(j.error||r.status);
 return j}
 async function setAsicPower(enabled){if(asicPowerBusy||asicRestartBusy)return;asicPowerBusy=true;

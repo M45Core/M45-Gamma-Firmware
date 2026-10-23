@@ -64,6 +64,7 @@ esp_err_t bitaxe_gamma602_prepare_io(void);
 esp_err_t bitaxe_gamma602_boot_fan_max(void);
 esp_err_t bitaxe_gamma602_start_fan(GlobalState *state);
 esp_err_t bitaxe_gamma602_start_hardware(GlobalState *state);
+void bitaxe_gamma602_log_read_retry(GlobalState *state, const char *reason);
 bool bitaxe_gamma602_asic_power_enabled(void);
 esp_err_t bitaxe_gamma602_set_asic_power(GlobalState *state, bool enabled, bool manage_fan);
 esp_err_t bitaxe_gamma602_set_frequency_mhz(GlobalState *state, uint16_t frequency_mhz);

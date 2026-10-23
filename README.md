@@ -242,8 +242,18 @@ ptrace-based runner, use `ASAN_OPTIONS=detect_leaks=0` because LeakSanitizer
 cannot run there.
 
 Run `tests/run-fault-diagnostics.sh` for sanitized host checks of TPS diagnostic
-formatting, legacy history migration, timestamp persistence, and error capture
-with live logging inactive.
+formatting, retained pre-error telemetry, legacy history migration, timestamp
+persistence, and error capture with live logging inactive.
+
+Run `python3 tests/run-hardware-startup.py`,
+`python3 tests/run-tps-read-retry.py`, `python3 tests/run-asic-rx-quiesce.py`,
+`tests/run-tps-readback.sh`, and `tests/run-chip-detection.sh` for sanitized
+checks covering the read grace window, hard-fault exclusions, startup failures,
+UART reader quiescence, and bounded chip detection with malformed traffic.
+
+Run `node --test tests/dashboard-faults.test.cjs` for dashboard checks covering
+failed startup banners, manual retry availability, safety shutdown controls,
+and dismissal of separate fault occurrences.
 
 ### Safety Behavior
 
@@ -255,7 +265,25 @@ condition is detected. Default shutdown limits include:
 - TPS546 temperature reaches `110 C`.
 - Input VIN falls below `4.8 V` or reaches `5.5 V`.
 - TPS546 output current reaches `33 A`.
-- TPS546 or temperature monitor reads fail while hardware is active.
+- Temperature monitor reads fail while hardware is active.
+
+ASIC detection and TPS546 read failures get a 5-second read-retry window.
+The firmware retries communication without rebooting or cycling ASIC power.
+Read attempts pause 100 ms between failures; an ASIC chip-ID receive can wait
+up to one second for a response within that window.
+A successful read clears the transient condition. If reads remain unavailable
+for the full window, the firmware shuts down and the dashboard shows the reason.
+A read transaction already in progress may finish after the retry deadline.
+Confirmed unsafe readings and regulator fault flags still shut down immediately.
+Fan, memory, writes, and other initialization failures do not use this read grace.
+Failed ASIC detection during a runtime startup permits a manual **Turn On** retry.
+
+Transient failures and fault-triggered shutdowns include the clock speed,
+voltage settings, and last valid TPS voltages and ASIC/VR temperatures in the
+diagnostic log. Sample ages identify older readings, and missing readings are
+marked unavailable. Read recovery or exhaustion is logged. Dismissing a
+dashboard fault hides that occurrence for the current page visit; a new failure
+or page visit shows it again.
 
 These limits are last-resort protections, not a substitute for proper cooling,
 power delivery, and monitoring. Unrestricted safety-limit ranges are available

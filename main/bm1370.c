@@ -3,6 +3,7 @@
 #include "asic_crc.h"
 #include "global_state.h"
 #include "asic_serial.h"
+#include "bitaxe_hw.h"
 #include "utils.h"
 
 #include "esp_log.h"
@@ -216,6 +217,20 @@ float BM1370_send_hash_frequency(float target_freq)
     return frequency;
 }
 
+static void request_chip_id_read(void *context)
+{
+    (void)context;
+    _send_BM1370((TYPE_CMD | GROUP_ALL | CMD_READ), (uint8_t[]){0x00, BM_CHIP_ID},
+                 2, BM1370_SERIALTX_DEBUG);
+}
+
+static void log_chip_id_read_event(void *context, bool recovered)
+{
+    bitaxe_gamma602_log_read_retry((GlobalState *)context,
+                                   recovered ? "ASIC chip-ID read recovered"
+                                             : "ASIC chip-ID read retrying");
+}
+
 uint8_t BM1370_init(void * pvParameters)
 {
     GlobalState * GLOBAL_STATE = (GlobalState *)pvParameters;
@@ -225,11 +240,9 @@ uint8_t BM1370_init(void * pvParameters)
         BM1370_set_version_mask(STRATUM_DEFAULT_VERSION_MASK);
     }
 
-    //read register 00 on all chips (should respond AA 55 13 68 00 00 00 00 00 00 0F)
-    _send_BM1370((TYPE_CMD | GROUP_ALL | CMD_READ), (uint8_t[]){0x00, BM_CHIP_ID}, 2, BM1370_SERIALTX_DEBUG);
-
     uint16_t asic_count = GLOBAL_STATE->DEVICE_CONFIG.family.asic_count;
-    int chip_counter = count_asic_chips(asic_count, BM1370_CHIP_ID, BM1370_CHIP_ID_RESPONSE_LENGTH);
+    int chip_counter = count_asic_chips(asic_count, BM1370_CHIP_ID, BM1370_CHIP_ID_RESPONSE_LENGTH,
+                                        request_chip_id_read, log_chip_id_read_event, GLOBAL_STATE);
 
     if (chip_counter <= 0 || chip_counter > 256) {
         ESP_LOGE(TAG, "Invalid BM1370 chip count detected: %d", chip_counter);

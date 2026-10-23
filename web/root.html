@@ -15,8 +15,8 @@
 <p class=subvalue>M45 Gamma supports board 602 only. Return to the retained AxeOS firmware to restore this device.</p>
 <div class=unsupported-actions><button id=axeos-return class=danger type=button>Return to AxeOS</button>
 <span id=axeos-return-status class=status-text></span></div></section>
-<section id=fault-panel class='panel full fault hidden'><div class=fault-head><div class=label>Safety Shutdown</div>
-<button id=fault-close class=fault-close type=button aria-label='Dismiss safety shutdown' title=Dismiss>&times;</button></div>
+<section id=fault-panel class='panel full fault hidden' role=alert><div class=fault-head><div id=fault-title class=label>Safety Shutdown</div>
+<button id=fault-close class=fault-close type=button aria-label='Dismiss hardware error' title=Dismiss>&times;</button></div>
 <ul id=fault-reasons class=fault-reasons></ul></section>
 <section id=voltage-limit-panel class='panel full voltage-limit hidden' role=alert>
 <div class='value small'>Overclock limited by voltage</div>

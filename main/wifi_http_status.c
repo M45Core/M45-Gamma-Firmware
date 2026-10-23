@@ -261,8 +261,7 @@ esp_err_t wifi_http_status_send(httpd_req_t *req,
     json_escape(scratch->pool_host, sizeof(scratch->pool_host),
                 stats->pool_host[0] != '\0' ? stats->pool_host : config->pool_host);
     json_escape(scratch->hardware_fault_msg, sizeof(scratch->hardware_fault_msg),
-                context->state->SYSTEM_MODULE.hardware_fault ? context->state->SYSTEM_MODULE.hardware_fault_msg
-                                                       : "");
+                context->state->SYSTEM_MODULE.hardware_fault_msg);
     json_escape(scratch->imported_board_version,
                 sizeof(scratch->imported_board_version),
                 m45_config_imported_board_version());
