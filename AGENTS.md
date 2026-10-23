@@ -2,6 +2,10 @@
 
 - Read `README.md` at the start of a new session.
 - Do not create branches or push changes without explicit user permission.
+- For version changes, write release notes, changelogs, and Discord blurbs from
+  the net diff between the previous published version and the new version.
+  Include only changes that remain in the final release; omit redundant
+  intermediate edits, reverted changes, and superseded approaches.
 - When adding or expanding web pages, HTTP routes, or JSON fields, audit every
   related fixed-size capacity. In particular, check HTTP handler slots, request
   and response buffers, task stacks, lwIP socket concurrency, generated web
